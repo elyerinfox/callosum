@@ -1,0 +1,21 @@
+[package]
+name = "callosum-wgpu"
+version.workspace = true
+edition.workspace = true
+description = "Pure-Rust multi-vendor GPU compute for callosum via wgpu (Vulkan / DX12 / Metal): Intel Arc, AMD, NVIDIA, Apple from one build."
+repository = "https://github.com/elyerinfox/callosum"
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+callosum = { workspace = true }
+wgpu = "24.0"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+anyhow = "1"
+callosum-models = { workspace = true }

@@ -1,0 +1,33 @@
+[package]
+name = "callosum-models"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+accelerate-src = { workspace = true, optional = true }
+byteorder = { workspace = true }
+callosum = { workspace = true }
+callosum-nn = { workspace = true }
+fancy-regex = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+num-traits = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_plain = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "callosum/accelerate", "callosum-nn/accelerate"]
+cuda = ["callosum/cuda", "callosum-nn/cuda"]
+cudnn = ["callosum/cudnn", "callosum-nn/cudnn"]
+mkl = ["dep:intel-mkl-src", "callosum/mkl", "callosum-nn/mkl"]
+metal = ["callosum/metal", "callosum-nn/metal"]

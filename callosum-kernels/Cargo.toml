@@ -1,0 +1,15 @@
+[package]
+name = "callosum-kernels"
+version = "0.10.2"
+edition = "2021"
+
+description = "CUDA kernels for Callosum"
+repository = "https://github.com/elyerinfox/callosum"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[build-dependencies]
+cudaforge = "0.1.2"
