@@ -6,7 +6,9 @@ use callosum::{
     shape::Dim, CpuStorage, CustomOp1, DType, Device, Error, IndexOp, Layout, Result, Shape,
     Tensor, WithDType, D,
 };
-use callosum_nn::{embedding, rms_norm, Activation, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use callosum_nn::{
+    embedding, rms_norm, Activation, Embedding, Linear, Module, RmsNorm, VarBuilder,
+};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Deserialize;
 
@@ -55,22 +57,30 @@ impl CustomOp1 for NonZero {
             callosum::CpuStorage::F8E4M3(vs) => self.nonzero(vs, layout),
             // Dummy types don't support nonzero operation
             callosum::CpuStorage::F6E2M3(_) => {
-                return Err(
-                    callosum::Error::UnsupportedDTypeForOp(callosum::DType::F6E2M3, "nonzero").bt(),
+                return Err(callosum::Error::UnsupportedDTypeForOp(
+                    callosum::DType::F6E2M3,
+                    "nonzero",
                 )
+                .bt())
             }
             callosum::CpuStorage::F6E3M2(_) => {
-                return Err(
-                    callosum::Error::UnsupportedDTypeForOp(callosum::DType::F6E3M2, "nonzero").bt(),
+                return Err(callosum::Error::UnsupportedDTypeForOp(
+                    callosum::DType::F6E3M2,
+                    "nonzero",
                 )
+                .bt())
             }
             callosum::CpuStorage::F4(_) => {
-                return Err(callosum::Error::UnsupportedDTypeForOp(callosum::DType::F4, "nonzero").bt())
+                return Err(
+                    callosum::Error::UnsupportedDTypeForOp(callosum::DType::F4, "nonzero").bt(),
+                )
             }
             callosum::CpuStorage::F8E8M0(_) => {
-                return Err(
-                    callosum::Error::UnsupportedDTypeForOp(callosum::DType::F8E8M0, "nonzero").bt(),
+                return Err(callosum::Error::UnsupportedDTypeForOp(
+                    callosum::DType::F8E8M0,
+                    "nonzero",
                 )
+                .bt())
             }
         };
         let index_len = layout.dims().len();

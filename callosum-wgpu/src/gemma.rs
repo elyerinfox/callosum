@@ -369,7 +369,7 @@ impl WgpuGemma {
             let is_local = if let Some(swa_hd) = key_length_swa {
                 head_dim == swa_hd
             } else {
-                sliding_window.is_some() && (b + 1) as u32 % sliding_window_pattern > 0
+                sliding_window.is_some() && !((b + 1) as u32).is_multiple_of(sliding_window_pattern)
             };
             let theta = if is_local { rope_base_swa } else { rope_base };
             // Freq table length is head_dim_global/2 — only attach where
@@ -408,6 +408,8 @@ impl WgpuGemma {
                 None
             };
 
+            // Recycle upload staging so weights aren't resident twice.
+            dev.reclaim_staging();
             blocks.push(Block {
                 head_dim,
                 n_kv_heads,
@@ -634,6 +636,7 @@ impl WgpuGemma {
                 false,
                 1.0,
                 freqs,
+                hd,
             )?;
 
             let reuses = matches!(cfg.n_layer_kv_from_start, Some(nk) if b_abs >= nk);
@@ -671,7 +674,7 @@ impl WgpuGemma {
                 };
                 let k = self
                     .dev
-                    .rope_scaled(&k, seq, n_kv, hd, pos0, blk.theta, false, 1.0, freqs)?;
+                    .rope_scaled(&k, seq, n_kv, hd, pos0, blk.theta, false, 1.0, freqs, hd)?;
                 self.dev.copy_rows(&k, &session.k[li], pos0, seq, kv_row)?;
                 self.dev.copy_rows(&v, &session.v[li], pos0, seq, kv_row)?;
                 (&session.k[li], &session.v[li])

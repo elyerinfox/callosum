@@ -69,7 +69,10 @@ pub struct PaellaVQ {
     down_blocks_conv: callosum_nn::Conv2d,
     down_blocks_bn: callosum_nn::BatchNorm,
     up_blocks_conv: callosum_nn::Conv2d,
-    up_blocks: Vec<(Vec<MixingResidualBlock>, Option<callosum_nn::ConvTranspose2d>)>,
+    up_blocks: Vec<(
+        Vec<MixingResidualBlock>,
+        Option<callosum_nn::ConvTranspose2d>,
+    )>,
 }
 
 impl PaellaVQ {

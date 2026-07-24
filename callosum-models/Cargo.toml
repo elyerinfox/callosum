@@ -24,6 +24,19 @@ serde_json = { workspace = true }
 serde_plain = { workspace = true }
 tracing = { workspace = true }
 
+# The flash-attn feature (candle heritage) was removed with the C/CUDA
+# FFI crate it gated; the cfg blocks remain in model sources as dead
+# code. Declare the cfg so `-D warnings` builds stay clean.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("flash-attn"))'] }
+
+# Style lints newer clippy raises against the inherited model zoo
+# (paddleocr, fastvit, stella); allowed rather than churning files we
+# only keep as CPU parity references.
+[lints.clippy]
+explicit_counter_loop = "allow"
+manual_checked_ops = "allow"
+
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "callosum/accelerate", "callosum-nn/accelerate"]

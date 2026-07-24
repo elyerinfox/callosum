@@ -5,7 +5,9 @@
 //! Based on implementation from [Huggingface Transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/falcon)
 
 use callosum::{DType, Device, Result, Tensor, D};
-use callosum_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
+use callosum_nn::{
+    embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder,
+};
 use serde::Deserialize;
 
 const MAX_SEQ_LEN: usize = 5000;

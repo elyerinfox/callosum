@@ -13,6 +13,7 @@
 //! every op lands with a parity test before it's reachable from model
 //! code.
 
+pub mod deepseek;
 pub mod gemma;
 pub mod llama;
 
@@ -93,6 +94,7 @@ struct Pipelines {
     gelu_mul: wgpu::ComputePipeline,
     softcap: wgpu::ComputePipeline,
     slice_cols: wgpu::ComputePipeline,
+    scatter_cols: wgpu::ComputePipeline,
     moe_topk: wgpu::ComputePipeline,
     moe_combine: wgpu::ComputePipeline,
     /// Per-format expert-indexed matmul (MoE), plus an f32 fallback.
@@ -115,6 +117,10 @@ struct Pipelines {
 pub struct WgpuDevice {
     inner: Arc<DeviceInner>,
 }
+
+/// Bind-group cache keyed by (pipeline, a, b, out, params) buffer ids.
+type BindCache =
+    std::collections::HashMap<(u64, u64, u64, u64, u64), std::sync::Arc<wgpu::BindGroup>>;
 
 struct DeviceInner {
     device: wgpu::Device,
@@ -143,9 +149,7 @@ struct DeviceInner {
     /// Bind groups keyed by the four bound buffers' global ids. With
     /// pooled buffers the same combinations recur every token, so this
     /// converges to a full hit rate after the first forward.
-    bind_cache: std::sync::Mutex<
-        std::collections::HashMap<(u64, u64, u64, u64, u64), std::sync::Arc<wgpu::BindGroup>>,
-    >,
+    bind_cache: std::sync::Mutex<BindCache>,
     pub info: AdapterDesc,
 }
 
@@ -458,6 +462,7 @@ impl WgpuDevice {
             gelu_mul: mk("gelu_mul"),
             softcap: mk("softcap"),
             slice_cols: mk("slice_cols"),
+            scatter_cols: mk("scatter_cols"),
             moe_topk: mk("moe_topk"),
             moe_combine: mk("moe_combine"),
             expert,
@@ -683,6 +688,17 @@ impl WgpuDevice {
         *self.inner.batch.lock().unwrap() = Some(Batch { enc, pass: None });
     }
 
+    /// Reclaim upload staging memory. `create_buffer_init` stages every
+    /// upload through transient buffers that are only recycled after a
+    /// queue submission is polled to completion — loading many GB of
+    /// weights without this holds the model resident TWICE and OOMs
+    /// adapters that could otherwise fit it. Engine loaders call this
+    /// periodically during weight upload.
+    pub fn reclaim_staging(&self) {
+        self.inner.queue.submit(std::iter::empty());
+        self.inner.device.poll(wgpu::Maintain::Wait);
+    }
+
     /// Submit any batched work. No-op when nothing is recording.
     pub fn flush(&self) {
         if let Some(mut b) = self.inner.batch.lock().unwrap().take() {
@@ -873,9 +889,61 @@ impl WgpuDevice {
         Ok(out)
     }
 
-    /// MoE routing: full-axis softmax over `logits` [m, n_experts],
-    /// iterative top-`slots` selection, weights renormalised over the
-    /// selected set. Returns [m, slots, 2] rows of (expert_id, weight).
+    /// Routing-policy options for [`Self::moe_topk`], mirroring
+    /// llama.cpp's build_moe_ffn knobs.
+    /// MoE routing over `logits` [m, n_experts]: softmax or sigmoid
+    /// mixture scores, optional selection bias, optional grouped
+    /// top-k, iterative top-`slots` selection, optional weight
+    /// renormalisation, routed scaling. Returns [m, slots, 2] rows of
+    /// (expert_id, weight).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_topk_opt(
+        &self,
+        logits: &GpuBuffer,
+        m: usize,
+        n_experts: usize,
+        slots: usize,
+        sigmoid: bool,
+        bias: Option<&GpuBuffer>,
+        renormalize: bool,
+        n_group: usize,
+        topk_group: usize,
+        route_scale: f32,
+    ) -> Result<GpuBuffer> {
+        if logits.len != m * n_experts || slots == 0 || slots > n_experts {
+            return Err(WgpuError::Shape("moe_topk: shape mismatch".into()));
+        }
+        if n_group > 32 {
+            return Err(WgpuError::Shape("moe_topk: n_group > 32".into()));
+        }
+        if let Some(b) = bias {
+            if b.len < n_experts {
+                return Err(WgpuError::Shape("moe_topk: bias too short".into()));
+            }
+        }
+        let out = self.alloc_out(m * slots * 2);
+        let params = Params {
+            m: m as u32,
+            k: n_experts as u32,
+            n_heads: slots as u32,
+            window: n_group as u32,
+            head_dim: topk_group as u32,
+            cap: route_scale,
+            flags: (sigmoid as u32) | ((bias.is_some() as u32) << 1) | ((renormalize as u32) << 2),
+            ..Default::default()
+        };
+        self.dispatch(
+            &self.inner.pipelines.moe_topk,
+            logits,
+            bias.unwrap_or(logits),
+            &out,
+            params,
+            (m as u32, 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// qwen3moe-style routing: softmax scores, top-k renormalised.
     pub fn moe_topk(
         &self,
         logits: &GpuBuffer,
@@ -883,25 +951,46 @@ impl WgpuDevice {
         n_experts: usize,
         slots: usize,
     ) -> Result<GpuBuffer> {
-        if logits.len != m * n_experts || slots == 0 || slots > n_experts {
-            return Err(WgpuError::Shape("moe_topk: shape mismatch".into()));
+        self.moe_topk_opt(logits, m, n_experts, slots, false, None, true, 1, 1, 1.0)
+    }
+
+    /// Write `a` ([rows_src, width]) into `out`'s columns
+    /// [off, off+width) with output stride `stride`; each group of
+    /// `group` consecutive output rows shares one source row (1 = plain
+    /// column write, n = per-head broadcast).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_cols(
+        &self,
+        a: &GpuBuffer,
+        out: &GpuBuffer,
+        rows_out: usize,
+        stride: usize,
+        off: usize,
+        width: usize,
+        group: usize,
+    ) -> Result<()> {
+        if out.len != rows_out * stride || off + width > stride || a.len * group < rows_out * width
+        {
+            return Err(WgpuError::Shape("scatter_cols: shape mismatch".into()));
         }
-        let out = self.alloc_out(m * slots * 2);
         let params = Params {
-            m: m as u32,
-            k: n_experts as u32,
-            n_heads: slots as u32,
+            m: rows_out as u32,
+            k: stride as u32,
+            n: width as u32,
+            pos0: off as u32,
+            n_kv_heads: group.max(1) as u32,
             ..Default::default()
         };
+        let groups = ((rows_out * width) as u32).div_ceil(256);
         self.dispatch(
-            &self.inner.pipelines.moe_topk,
-            logits,
-            logits,
-            &out,
+            &self.inner.pipelines.scatter_cols,
+            a,
+            a,
+            out,
             params,
-            (m as u32, 1, 1),
+            (groups, 1, 1),
         );
-        Ok(out)
+        Ok(())
     }
 
     /// Expert-indexed matmul over a fused quantized expert tensor
@@ -1194,7 +1283,7 @@ impl WgpuDevice {
         seq: usize,
         hidden: usize,
     ) -> Result<GpuBuffer> {
-        if ids.len != seq || table.len % hidden != 0 {
+        if ids.len != seq || !table.len.is_multiple_of(hidden) {
             return Err(WgpuError::Shape("embed_gather: shape mismatch".into()));
         }
         let out = self.alloc_out(seq * hidden);
@@ -1266,12 +1355,16 @@ impl WgpuDevice {
         interleaved: bool,
         fscale: f32,
         freqs: Option<&GpuBuffer>,
+        rot_dim: usize,
     ) -> Result<GpuBuffer> {
         if x.len != seq * heads * head_dim {
             return Err(WgpuError::Shape("rope: shape mismatch".into()));
         }
+        if rot_dim > head_dim || !rot_dim.is_multiple_of(2) {
+            return Err(WgpuError::Shape("rope: bad rot_dim".into()));
+        }
         if let Some(f) = freqs {
-            if f.len < head_dim / 2 {
+            if f.len < rot_dim.max(head_dim) / 2 {
                 return Err(WgpuError::Shape("rope: freq table too short".into()));
             }
         }
@@ -1280,6 +1373,12 @@ impl WgpuDevice {
             m: seq as u32,
             n_heads: heads as u32,
             head_dim: head_dim as u32,
+            // Partial rotary width; 0 = full head_dim.
+            n: if rot_dim == head_dim {
+                0
+            } else {
+                rot_dim as u32
+            },
             pos0: pos0 as u32,
             theta,
             fscale,
@@ -1461,7 +1560,7 @@ impl WgpuDevice {
         k: usize,
         dtype: QuantDtype,
     ) -> Result<QuantBuffer> {
-        if k % dtype.block_elems() != 0 {
+        if !k.is_multiple_of(dtype.block_elems()) {
             return Err(WgpuError::Shape(format!(
                 "{dtype:?}: k={k} not a multiple of {}",
                 dtype.block_elems()

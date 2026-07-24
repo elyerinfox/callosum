@@ -221,8 +221,9 @@ impl Encodec {
 }
 
 pub fn load(model_file: &str, num_codebooks: Option<usize>, dev: &Device) -> Result<Encodec> {
-    let vb =
-        unsafe { callosum_nn::VarBuilder::from_mmaped_safetensors(&[model_file], DType::F32, dev)? };
+    let vb = unsafe {
+        callosum_nn::VarBuilder::from_mmaped_safetensors(&[model_file], DType::F32, dev)?
+    };
     let cfg = Config::v0_1(num_codebooks);
     let encodec = Encodec::new(cfg, vb)?;
     Ok(encodec)

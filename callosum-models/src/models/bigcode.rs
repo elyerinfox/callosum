@@ -22,7 +22,9 @@
 //!
 
 use callosum::{DType, Device, IndexOp, Result, Tensor, D};
-use callosum_nn::{embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
+use callosum_nn::{
+    embedding, linear_b as linear, Embedding, LayerNorm, Linear, Module, VarBuilder,
+};
 
 fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<LayerNorm> {
     let weight = vb.get(size, "weight")?;

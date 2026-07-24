@@ -576,8 +576,13 @@ impl TinyViT {
         let last_embed_dim = embed_dims[embed_dims.len() - 1];
         // let norm_head = callosum_nn::layer_norm(last_embed_dim, 1e-5, vb.pp("norm_head"))?;
         // let head = callosum_nn::linear(last_embed_dim, num_classes, vb.pp("head"))?;
-        let neck_conv1 =
-            callosum_nn::conv2d_no_bias(last_embed_dim, 256, 1, Default::default(), vb.pp("neck.0"))?;
+        let neck_conv1 = callosum_nn::conv2d_no_bias(
+            last_embed_dim,
+            256,
+            1,
+            Default::default(),
+            vb.pp("neck.0"),
+        )?;
         let neck_ln1 = super::LayerNorm2d::new(256, 1e-6, vb.pp("neck.1"))?;
         let cfg = callosum_nn::Conv2dConfig {
             padding: 1,

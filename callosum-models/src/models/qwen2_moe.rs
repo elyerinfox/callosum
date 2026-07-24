@@ -313,9 +313,9 @@ impl Module for SparseMoeBlock {
             ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
         }
         let shared_expert_output = xs.apply(&self.shared_expert)?;
-        let shared_expert_output = shared_expert_output.broadcast_mul(&callosum_nn::ops::sigmoid(
-            &xs.apply(&self.shared_expert_gate)?,
-        )?)?;
+        let shared_expert_output = shared_expert_output.broadcast_mul(
+            &callosum_nn::ops::sigmoid(&xs.apply(&self.shared_expert_gate)?)?,
+        )?;
         let ys = (ys + shared_expert_output)?;
         let ys = ys.reshape((b_size, seq_len, hidden_dim))?;
         Ok(ys)

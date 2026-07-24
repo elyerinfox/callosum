@@ -51,6 +51,15 @@ pub struct LlamaConfig {
     /// MoE expert counts (qwen3moe). 0 for dense models.
     pub n_experts: usize,
     pub n_experts_used: usize,
+    /// Partial-rotary width (GLM-4 rotates only the first half of each
+    /// head). Equal to head_dim when full-width.
+    pub rot_dim: usize,
+    /// MoE routing policy (glm4moe): sigmoid mixture scores instead of
+    /// softmax, weight renormalisation over the selected set, and a
+    /// final scale on the mixture weights.
+    pub moe_sigmoid: bool,
+    pub moe_weights_norm: bool,
+    pub moe_weights_scale: f32,
 }
 
 enum Weight {
@@ -182,13 +191,18 @@ fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
 /// in-shader.
 enum Ffn {
     Dense {
-        gate: Weight,
+        /// None = GLM-4 fused gate+up: `up` is [2*intermediate, hidden]
+        /// and SWIGLU splits its output halves.
+        gate: Option<Weight>,
         up: Weight,
         down: Weight,
     },
     Moe {
         /// hidden → n_experts router.
         router: Weight,
+        /// V3-style selection bias (`exp_probs_b`) added to the scores
+        /// before top-k; mixture weights stay unbiased.
+        router_bias: Option<GpuBuffer>,
         /// Fused [n_experts * ffn_dim, hidden].
         gates: Weight,
         /// Fused [n_experts * ffn_dim, hidden].
@@ -196,6 +210,9 @@ enum Ffn {
         /// Fused [n_experts * hidden, ffn_dim].
         downs: Weight,
         ffn_dim: usize,
+        /// Fused shared experts (glm4moe/deepseek `shexp`), run dense
+        /// on the same input and added to the routed mixture.
+        shared: Option<Box<(Weight, Weight, Weight)>>,
     },
 }
 
@@ -215,6 +232,9 @@ struct Block {
     k_norm: Option<GpuBuffer>,
     ffn_norm: GpuBuffer,
     ffn: Ffn,
+    /// GLM-4 sandwich norms (output-normalised before residual adds).
+    post_attn_norm: Option<GpuBuffer>,
+    post_ffn_norm: Option<GpuBuffer>,
 }
 
 pub struct WgpuLlama {
@@ -315,24 +335,29 @@ impl WgpuLlama {
             .unwrap_or_else(|| "llama".to_string());
         if !matches!(
             arch.as_str(),
-            "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35moe"
+            "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35moe" | "glm4" | "glm4moe"
         ) {
             return Err(WgpuError::Device(format!(
-                "callosum-wgpu llama loader supports llama/mistral/qwen2/qwen3/qwen3moe (got {arch:?})"
+                "callosum-wgpu llama loader supports llama/mistral/qwen2/qwen3/qwen3moe/glm4/glm4moe (got {arch:?})"
             )));
         }
         // Interleaved pairs (2i, 2i+1) for llama-lineage GGUFs,
         // rotate-half (i, i+d/2) for the qwen family.
-        let rope_interleaved = matches!(arch.as_str(), "llama" | "mistral");
+        let rope_interleaved = matches!(arch.as_str(), "llama" | "mistral" | "glm4");
         let is_moe = arch.ends_with("moe");
         let key = |suffix: &str| format!("{arch}.{suffix}");
 
         let hidden = meta_u32(&content, &[&key("embedding_length")])
             .ok_or_else(|| WgpuError::Device("missing embedding_length".into()))?
             as usize;
+        // glm4moe appends `nextn_predict_layers` MTP blocks (nextn.*
+        // tensors) after the real blocks — excluded from the forward
+        // pass, exactly as llama.cpp does.
+        let nextn = meta_u32(&content, &[&key("nextn_predict_layers")]).unwrap_or(0) as usize;
         let n_layers = meta_u32(&content, &[&key("block_count")])
             .ok_or_else(|| WgpuError::Device("missing block_count".into()))?
             as usize;
+        let n_layers = n_layers.saturating_sub(nextn);
         let n_heads = meta_u32(&content, &[&key("attention.head_count")])
             .ok_or_else(|| WgpuError::Device("missing head_count".into()))?
             as usize;
@@ -342,6 +367,10 @@ impl WgpuLlama {
         let head_dim = meta_u32(&content, &[&key("attention.key_length")])
             .map(|v| v as usize)
             .unwrap_or(hidden / n_heads);
+        let rot_dim = meta_u32(&content, &[&key("rope.dimension_count")])
+            .map(|v| v as usize)
+            .filter(|&d| d < head_dim)
+            .unwrap_or(head_dim);
         let rope_theta = meta_f32(&content, &[&key("rope.freq_base")]).unwrap_or(10_000.0);
         let n_experts = meta_u32(&content, &[&key("expert_count")]).unwrap_or(0) as usize;
         let n_experts_used = meta_u32(&content, &[&key("expert_used_count")]).unwrap_or(0) as usize;
@@ -352,6 +381,17 @@ impl WgpuLlama {
         }
         let rms_eps =
             meta_f32(&content, &[&key("attention.layer_norm_rms_epsilon")]).unwrap_or(1e-5);
+        // glm4moe defaults to sigmoid gating when the gating-func key is
+        // absent (llama.cpp load_arch_hparams); 2 = sigmoid explicitly.
+        let moe_sigmoid = meta_u32(&content, &[&key("expert_gating_func")])
+            .map(|g| g == 2)
+            .unwrap_or(arch == "glm4moe");
+        let moe_weights_norm = content
+            .metadata
+            .get(&key("expert_weights_norm"))
+            .and_then(|v| v.to_bool().ok())
+            .unwrap_or(!moe_sigmoid);
+        let moe_weights_scale = meta_f32(&content, &[&key("expert_weights_scale")]).unwrap_or(1.0);
 
         let layer_end = layer_end.min(n_layers);
         if layer_start >= layer_end {
@@ -475,7 +515,6 @@ impl WgpuLlama {
         let mut blocks = Vec::with_capacity(layer_end - layer_start);
         for b in layer_start..layer_end {
             let (attn_norm, _) = load_f32(&format!("blk.{b}.attn_norm.weight"))?;
-            let (ffn_norm, _) = load_f32(&format!("blk.{b}.ffn_norm.weight"))?;
             let mut opt_f32 = |name: String| -> Result<Option<GpuBuffer>> {
                 if has(&name) {
                     load_f32(&name).map(|(buf, _)| Some(buf))
@@ -488,6 +527,21 @@ impl WgpuLlama {
             let bv = opt_f32(format!("blk.{b}.attn_v.bias"))?;
             let q_norm = opt_f32(format!("blk.{b}.attn_q_norm.weight"))?;
             let k_norm = opt_f32(format!("blk.{b}.attn_k_norm.weight"))?;
+            let mut post_attn_norm = opt_f32(format!("blk.{b}.post_attention_norm.weight"))?;
+            let post_ffn_norm = opt_f32(format!("blk.{b}.post_ffw_norm.weight"))?;
+            let router_bias = opt_f32(format!("blk.{b}.exp_probs_b.bias"))?;
+            // glm4moe ships no ffn_norm: post_attention_norm IS the
+            // pre-FFN norm (standard residual structure — llama.cpp
+            // build_glm4_moe), not a sandwich norm.
+            let ffn_norm = if has(&format!("blk.{b}.ffn_norm.weight")) {
+                load_f32(&format!("blk.{b}.ffn_norm.weight"))?.0
+            } else {
+                post_attn_norm.take().ok_or_else(|| {
+                    WgpuError::Device(format!(
+                        "blk.{b}: neither ffn_norm nor post_attention_norm present"
+                    ))
+                })?
+            };
             let ffn = if has(&format!("blk.{b}.ffn_gate_inp.weight")) {
                 let gates = load_expert_weight(&format!("blk.{b}.ffn_gate_exps.weight"))?;
                 let ffn_dim = match &gates {
@@ -495,20 +549,37 @@ impl WgpuLlama {
                     Weight::F32 { n, .. } => *n / n_experts,
                     Weight::Quant(q) => q.n / n_experts,
                 };
+                let shared = if has(&format!("blk.{b}.ffn_gate_shexp.weight")) {
+                    Some(Box::new((
+                        load_weight(&format!("blk.{b}.ffn_gate_shexp.weight"))?,
+                        load_weight(&format!("blk.{b}.ffn_up_shexp.weight"))?,
+                        load_weight(&format!("blk.{b}.ffn_down_shexp.weight"))?,
+                    )))
+                } else {
+                    None
+                };
                 Ffn::Moe {
                     router: load_weight(&format!("blk.{b}.ffn_gate_inp.weight"))?,
+                    router_bias,
                     gates,
                     ups: load_expert_weight(&format!("blk.{b}.ffn_up_exps.weight"))?,
                     downs: load_expert_weight(&format!("blk.{b}.ffn_down_exps.weight"))?,
                     ffn_dim,
+                    shared,
                 }
             } else {
                 Ffn::Dense {
-                    gate: load_weight(&format!("blk.{b}.ffn_gate.weight"))?,
+                    gate: if has(&format!("blk.{b}.ffn_gate.weight")) {
+                        Some(load_weight(&format!("blk.{b}.ffn_gate.weight"))?)
+                    } else {
+                        None
+                    },
                     up: load_weight(&format!("blk.{b}.ffn_up.weight"))?,
                     down: load_weight(&format!("blk.{b}.ffn_down.weight"))?,
                 }
             };
+            // Recycle upload staging so weights aren't resident twice.
+            dev.reclaim_staging();
             blocks.push(Block {
                 attn_norm,
                 wq: load_weight(&format!("blk.{b}.attn_q.weight"))?,
@@ -522,6 +593,8 @@ impl WgpuLlama {
                 k_norm,
                 ffn_norm,
                 ffn,
+                post_attn_norm,
+                post_ffn_norm,
             });
         }
 
@@ -560,6 +633,10 @@ impl WgpuLlama {
                 rope_interleaved,
                 n_experts,
                 n_experts_used,
+                rot_dim,
+                moe_sigmoid,
+                moe_weights_norm,
+                moe_weights_scale,
             },
             embed,
             blocks,
@@ -697,7 +774,7 @@ impl WgpuLlama {
                     .dev
                     .rms_norm(&k, w, seq * cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)?;
             }
-            let q = self.dev.rope(
+            let q = self.dev.rope_scaled(
                 &q,
                 seq,
                 cfg.n_heads,
@@ -705,8 +782,11 @@ impl WgpuLlama {
                 pos0,
                 cfg.rope_theta,
                 cfg.rope_interleaved,
+                1.0,
+                None,
+                cfg.rot_dim,
             )?;
-            let k = self.dev.rope(
+            let k = self.dev.rope_scaled(
                 &k,
                 seq,
                 cfg.n_kv_heads,
@@ -714,6 +794,9 @@ impl WgpuLlama {
                 pos0,
                 cfg.rope_theta,
                 cfg.rope_interleaved,
+                1.0,
+                None,
+                cfg.rot_dim,
             )?;
             self.dev.copy_rows(&k, &session.k[li], pos0, seq, kv_row)?;
             self.dev.copy_rows(&v, &session.v[li], pos0, seq, kv_row)?;
@@ -739,6 +822,10 @@ impl WgpuLlama {
                 cfg.head_dim,
             )?;
             let o = blk.wo.matmul_t(&self.dev, &att, seq)?;
+            let o = match &blk.post_attn_norm {
+                Some(w) => self.dev.rms_norm(&o, w, seq, cfg.hidden, cfg.rms_eps)?,
+                None => o,
+            };
             x = self.dev.add(&x, &o)?;
 
             let h2 = self
@@ -746,26 +833,54 @@ impl WgpuLlama {
                 .rms_norm(&x, &blk.ffn_norm, seq, cfg.hidden, cfg.rms_eps)?;
             let d = match &blk.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    let g = gate.matmul_t(&self.dev, &h2, seq)?;
-                    let u = up.matmul_t(&self.dev, &h2, seq)?;
-                    let gu = self.dev.silu_mul(&g, &u)?;
+                    let gu = match gate {
+                        Some(gate) => {
+                            let g = gate.matmul_t(&self.dev, &h2, seq)?;
+                            let u = up.matmul_t(&self.dev, &h2, seq)?;
+                            self.dev.silu_mul(&g, &u)?
+                        }
+                        None => {
+                            // Fused gate+up (GLM-4): one matmul to
+                            // [seq, 2*intermediate], split halves,
+                            // silu(first) * second.
+                            let w = up.matmul_t(&self.dev, &h2, seq)?;
+                            let two_f = up.out_features();
+                            let f = two_f / 2;
+                            let g = self.dev.slice_cols(&w, seq, two_f, 0, f)?;
+                            let u = self.dev.slice_cols(&w, seq, two_f, f, f)?;
+                            self.dev.silu_mul(&g, &u)?
+                        }
+                    };
                     down.matmul_t(&self.dev, &gu, seq)?
                 }
                 Ffn::Moe {
                     router,
+                    router_bias,
                     gates,
                     ups,
                     downs,
                     ffn_dim,
+                    shared,
                 } => {
-                    // Same routing rule as the CUDA backend's run_moe:
-                    // softmax over the FULL expert axis, top-k of the
-                    // probabilities, weights renormalised over the
-                    // selected set, SwiGLU per expert, weighted sum.
+                    // Same routing rule as the CUDA backend's
+                    // run_moe_opts: softmax (qwen/deepseek-v2) or
+                    // sigmoid (glm4moe/v3) mixture scores, optional
+                    // selection bias, top-k, optional renormalisation
+                    // over the selected set, SwiGLU per expert,
+                    // weighted sum, plus dense shared experts.
                     let logits = router.matmul_t(&self.dev, &h2, seq)?;
-                    let routing =
-                        self.dev
-                            .moe_topk(&logits, seq, cfg.n_experts, cfg.n_experts_used)?;
+                    let routing = self.dev.moe_topk_opt(
+                        &logits,
+                        seq,
+                        cfg.n_experts,
+                        cfg.n_experts_used,
+                        cfg.moe_sigmoid,
+                        router_bias.as_ref(),
+                        cfg.moe_weights_norm,
+                        1,
+                        1,
+                        cfg.moe_weights_scale,
+                    )?;
                     let slots = cfg.n_experts_used;
                     let g = expert_matmul(
                         &self.dev, gates, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden, false,
@@ -777,8 +892,22 @@ impl WgpuLlama {
                     let d = expert_matmul(
                         &self.dev, downs, &gu, &routing, seq, slots, cfg.hidden, *ffn_dim, true,
                     )?;
-                    self.dev.moe_combine(&d, &routing, seq, slots, cfg.hidden)?
+                    let routed = self.dev.moe_combine(&d, &routing, seq, slots, cfg.hidden)?;
+                    match shared.as_deref() {
+                        Some((sg, su, sd)) => {
+                            let g = sg.matmul_t(&self.dev, &h2, seq)?;
+                            let u = su.matmul_t(&self.dev, &h2, seq)?;
+                            let gu = self.dev.silu_mul(&g, &u)?;
+                            let s = sd.matmul_t(&self.dev, &gu, seq)?;
+                            self.dev.add(&routed, &s)?
+                        }
+                        None => routed,
+                    }
                 }
+            };
+            let d = match &blk.post_ffn_norm {
+                Some(w) => self.dev.rms_norm(&d, w, seq, cfg.hidden, cfg.rms_eps)?,
+                None => d,
             };
             x = self.dev.add(&x, &d)?;
         }

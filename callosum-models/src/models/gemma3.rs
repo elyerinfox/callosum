@@ -190,7 +190,10 @@ impl Attention {
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
         let kv_cache = if let Some(sliding_window) = sliding_window {
-            KvCache::Rotating(callosum_nn::kv_cache::RotatingKvCache::new(2, sliding_window))
+            KvCache::Rotating(callosum_nn::kv_cache::RotatingKvCache::new(
+                2,
+                sliding_window,
+            ))
         } else {
             KvCache::Normal(callosum_nn::kv_cache::KvCache::new(
                 2,

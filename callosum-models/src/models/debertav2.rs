@@ -344,9 +344,11 @@ impl DebertaV2DisentangledSelfAttention {
 
         let all_head_size = num_attention_heads * attention_head_size;
 
-        let query_proj = callosum_nn::linear(config.hidden_size, all_head_size, vb.pp("query_proj"))?;
+        let query_proj =
+            callosum_nn::linear(config.hidden_size, all_head_size, vb.pp("query_proj"))?;
         let key_proj = callosum_nn::linear(config.hidden_size, all_head_size, vb.pp("key_proj"))?;
-        let value_proj = callosum_nn::linear(config.hidden_size, all_head_size, vb.pp("value_proj"))?;
+        let value_proj =
+            callosum_nn::linear(config.hidden_size, all_head_size, vb.pp("value_proj"))?;
 
         let share_att_key = config.share_att_key.unwrap_or(false);
         let relative_attention = config.relative_attention;

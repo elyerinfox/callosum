@@ -253,7 +253,8 @@ impl Decoder {
         let mut embed_tokens = Vec::with_capacity(cfg.num_codebooks);
         let vb_e = vb_d.pp("embed_tokens");
         for embed_idx in 0..cfg.num_codebooks {
-            let e = callosum_nn::embedding(cfg.vocab_size + 1, cfg.hidden_size, vb_e.pp(embed_idx))?;
+            let e =
+                callosum_nn::embedding(cfg.vocab_size + 1, cfg.hidden_size, vb_e.pp(embed_idx))?;
             embed_tokens.push(e)
         }
         let embed_positions = vb_d.get(

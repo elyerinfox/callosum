@@ -438,7 +438,8 @@ impl ImageEncoderViT {
             padding: 1,
             ..Default::default()
         };
-        let neck_conv2 = callosum_nn::conv2d_no_bias(out_chans, out_chans, 3, cfg, vb.pp("neck.2"))?;
+        let neck_conv2 =
+            callosum_nn::conv2d_no_bias(out_chans, out_chans, 3, cfg, vb.pp("neck.2"))?;
         let neck_ln2 = super::LayerNorm2d::new(out_chans, 1e-6, vb.pp("neck.3"))?;
         let pos_embed = if use_abs_pos {
             let p = vb.get(

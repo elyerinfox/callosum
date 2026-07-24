@@ -45,7 +45,8 @@ impl LogitsProcessor {
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
-        let sampled = callosum_nn::sampling::gumbel_softmax(logits, temperature, callosum::D::Minus1)?;
+        let sampled =
+            callosum_nn::sampling::gumbel_softmax(logits, temperature, callosum::D::Minus1)?;
         sampled.to_scalar::<u32>()
     }
 

@@ -60,7 +60,8 @@ impl Model {
         )?;
         let multi_modal_projector = MultiModalProjector::new(
             cfg,
-            vb.pp("multi_modal_projector").to_dtype(callosum::DType::F32),
+            vb.pp("multi_modal_projector")
+                .to_dtype(callosum::DType::F32),
         )?;
         Ok(Self {
             multi_modal_projector,

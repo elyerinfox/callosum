@@ -231,3 +231,86 @@ fn gemma_probe_layers() {
         }
     }
 }
+
+/// GLM-4 (partial interleaved rotary, fused gate+up SWIGLU, sandwich
+/// norms, QKV biases) token parity vs callosum-models' CPU
+/// quantized_glm4. Gated on GLM4_GGUF.
+#[test]
+fn wgpu_glm4_matches_cpu_reference_tokens() {
+    let Some(path) = std::env::var_os("GLM4_GGUF") else {
+        eprintln!("GLM4_GGUF not set, skipping glm4 parity");
+        return;
+    };
+    let Some(dev) = device() else { return };
+    let path = std::path::PathBuf::from(path);
+
+    let cpu = callosum::Device::Cpu;
+    let mut f = std::fs::File::open(&path).unwrap();
+    let content = callosum::quantized::gguf_file::Content::read(&mut f).unwrap();
+    let mut cpu_model = callosum_models::models::quantized_glm4::ModelWeights::from_gguf(
+        content,
+        &mut f,
+        &cpu,
+        callosum::DType::F32,
+    )
+    .unwrap();
+
+    let gpu_model = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();
+    assert!(
+        gpu_model.cfg.rot_dim < gpu_model.cfg.head_dim,
+        "partial rotary expected"
+    );
+    let mut session = gpu_model.new_session(64);
+
+    // [gMASK]<sop><|user|>\nHello<|assistant|> token ids don't matter —
+    // determinism does. Use small in-vocab ids.
+    let prompt: Vec<u32> = vec![151331, 151333, 151336, 198, 9707, 151337];
+    let n_gen = 6;
+
+    let mut cpu_tokens = prompt.clone();
+    let mut pos = 0usize;
+    for _ in 0..n_gen {
+        let input: Vec<u32> = if pos == 0 {
+            cpu_tokens.clone()
+        } else {
+            vec![*cpu_tokens.last().unwrap()]
+        };
+        let t = callosum::Tensor::new(input.as_slice(), &cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let logits = cpu_model.forward(&t, pos).unwrap();
+        pos += input.len();
+        let v: Vec<f32> = logits
+            .flatten_all()
+            .unwrap()
+            .to_dtype(callosum::DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let vocab = gpu_model.n_logits();
+        cpu_tokens.push(argmax_of(&v[v.len() - vocab..]));
+    }
+
+    let mut gpu_tokens = prompt.clone();
+    for step in 0..n_gen {
+        let input: Vec<u32> = if step == 0 {
+            gpu_tokens.clone()
+        } else {
+            vec![*gpu_tokens.last().unwrap()]
+        };
+        let logits = gpu_model.forward(&mut session, &input).unwrap();
+        gpu_tokens.push(argmax_of(&logits));
+    }
+
+    assert_eq!(
+        &cpu_tokens[prompt.len()..],
+        &gpu_tokens[prompt.len()..],
+        "wgpu glm4 greedy tokens diverge from CPU reference"
+    );
+    eprintln!(
+        "wgpu glm4 parity OK on {}: {:?}",
+        dev.info().name,
+        &gpu_tokens[prompt.len()..]
+    );
+}

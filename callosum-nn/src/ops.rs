@@ -614,7 +614,8 @@ impl callosum::CustomOp2 for RmsNorm {
             &output,
         )
         .map_err(callosum::Error::wrap)?;
-        let newstorage = callosum::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage =
+            callosum::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -861,7 +862,8 @@ impl callosum::CustomOp3 for LayerNorm {
             &output,
         )
         .map_err(callosum::Error::wrap)?;
-        let newstorage = callosum::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage =
+            callosum::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
 }

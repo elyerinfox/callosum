@@ -170,6 +170,14 @@ fn moe_topk(@builtin(workgroup_id) wid: vec3<u32>) {
     let n_e = params.k;
     let slots = params.n_heads;
     let base = t * n_e;
+    let sigmoid_gate = (params.flags & 1u) != 0u;
+    let has_bias = (params.flags & 2u) != 0u;
+    let renorm = (params.flags & 4u) != 0u;
+    let n_group = max(params.window, 1u);
+    let topk_group = max(params.head_dim, 1u);
+    let route_scale = select(params.cap, 1.0, params.cap == 0.0);
+
+    // Mixture scores: softmax (qwen/deepseek-v2) or sigmoid (v3/glm4moe).
     var mx: f32 = -3.4e38;
     for (var e: u32 = 0u; e < n_e; e = e + 1u) {
         mx = max(mx, a[base + e]);
@@ -178,31 +186,101 @@ fn moe_topk(@builtin(workgroup_id) wid: vec3<u32>) {
     for (var e: u32 = 0u; e < n_e; e = e + 1u) {
         denom = denom + exp(a[base + e] - mx);
     }
+    // score(e): mixture weight; sel(e): selection score (bias added).
+    // Groups outside the topk_group best (by sum of each group's top-2
+    // selection scores) are excluded from selection entirely.
+    var group_mask: u32 = 0xffffffffu;
+    if (n_group > 1u) {
+        let gsize = n_e / n_group;
+        group_mask = 0u;
+        // Pick topk_group groups by their top-2 sum.
+        for (var pick: u32 = 0u; pick < topk_group; pick = pick + 1u) {
+            var best_g: u32 = 0u;
+            var best_v: f32 = -3.4e38;
+            for (var g: u32 = 0u; g < n_group; g = g + 1u) {
+                if ((group_mask & (1u << g)) != 0u) {
+                    continue;
+                }
+                var top1: f32 = -3.4e38;
+                var top2: f32 = -3.4e38;
+                for (var j: u32 = 0u; j < gsize; j = j + 1u) {
+                    let e = g * gsize + j;
+                    var sv = a[base + e];
+                    if (sigmoid_gate) {
+                        sv = 1.0 / (1.0 + exp(-sv));
+                    } else {
+                        sv = exp(sv - mx) / denom;
+                    }
+                    if (has_bias) {
+                        sv = sv + b[e];
+                    }
+                    if (sv > top1) {
+                        top2 = top1;
+                        top1 = sv;
+                    } else if (sv > top2) {
+                        top2 = sv;
+                    }
+                }
+                // Group score = sum of the group's top-2 selection
+                // scores (single-expert groups contribute just top1).
+                let gscore = top1 + select(top2, 0.0, top2 < -1.0e37);
+                if (gscore > best_v) {
+                    best_v = gscore;
+                    best_g = g;
+                }
+            }
+            group_mask = group_mask | (1u << best_g);
+        }
+    }
+
     var wsum: f32 = 0.0;
     for (var s: u32 = 0u; s < slots; s = s + 1u) {
-        var best: u32 = 0u;
+        var best: u32 = 0xffffffffu;
         var best_v: f32 = -3.4e38;
         for (var e: u32 = 0u; e < n_e; e = e + 1u) {
+            if (n_group > 1u) {
+                let g = e / (n_e / n_group);
+                if ((group_mask & (1u << g)) == 0u) {
+                    continue;
+                }
+            }
             var taken = false;
             for (var s2: u32 = 0u; s2 < s; s2 = s2 + 1u) {
                 if (u32(out[(t * slots + s2) * 2u]) == e) {
                     taken = true;
                 }
             }
-            if (!taken && a[base + e] > best_v) {
-                best_v = a[base + e];
+            if (taken) {
+                continue;
+            }
+            var sv = a[base + e];
+            if (sigmoid_gate) {
+                sv = 1.0 / (1.0 + exp(-sv));
+            } else {
+                sv = exp(sv - mx) / denom;
+            }
+            if (has_bias) {
+                sv = sv + b[e];
+            }
+            if (sv > best_v) {
+                best_v = sv;
                 best = e;
             }
         }
-        let p = exp(a[base + best] - mx) / denom;
+        // Mixture weight is the UNBIASED score of the selected expert.
+        var p: f32;
+        if (sigmoid_gate) {
+            p = 1.0 / (1.0 + exp(-a[base + best]));
+        } else {
+            p = exp(a[base + best] - mx) / denom;
+        }
         out[(t * slots + s) * 2u] = f32(best);
         out[(t * slots + s) * 2u + 1u] = p;
         wsum = wsum + p;
     }
-    if (wsum > 0.0) {
-        for (var s: u32 = 0u; s < slots; s = s + 1u) {
-            out[(t * slots + s) * 2u + 1u] = out[(t * slots + s) * 2u + 1u] / wsum;
-        }
+    let d = select(1.0, wsum, renorm && wsum > 0.0);
+    for (var s: u32 = 0u; s < slots; s = s + 1u) {
+        out[(t * slots + s) * 2u + 1u] = out[(t * slots + s) * 2u + 1u] / d * route_scale;
     }
 }
 
@@ -240,6 +318,24 @@ fn slice_cols(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = i / params.n;
     let j = i % params.n;
     out[i] = a[r * params.k + params.pos0 + j];
+}
+
+// out[r, pos0..pos0+n] = a[r / n_kv_heads, 0..n] over m output rows of
+// stride k — writes a column span into a preallocated buffer, with the
+// source row shared by groups of n_kv_heads consecutive output rows
+// (n_kv_heads = 1 for a plain column write; = heads to broadcast MLA's
+// single rope'd K head across all heads).
+@compute @workgroup_size(256, 1, 1)
+fn scatter_cols(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let total = params.m * params.n;
+    if (i >= total) {
+        return;
+    }
+    let r = i / params.n;
+    let j = i % params.n;
+    let src = r / params.n_kv_heads;
+    out[r * params.k + params.pos0 + j] = a[src * params.n + j];
 }
 
 var<workgroup> scratch: array<f32, 256>;
@@ -381,8 +477,17 @@ fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = rem % params.n_heads;
     let s = rem / params.n_heads;
     let base = (s * params.n_heads + h) * params.head_dim;
+    // Partial rotary (params.n = rot width, 0 = full): pairs past the
+    // rotated span copy through unchanged; the inv-freq exponent runs
+    // over the ROTATED width (GLM-4 semantics).
+    let rot = select(params.head_dim, params.n, params.n != 0u);
+    if (2u * d >= rot) {
+        out[base + 2u * d]      = a[base + 2u * d];
+        out[base + 2u * d + 1u] = a[base + 2u * d + 1u];
+        return;
+    }
     let pos = f32(params.pos0 + s) * params.fscale;
-    var inv_freq = pow(params.theta, -2.0 * f32(d) / f32(params.head_dim));
+    var inv_freq = pow(params.theta, -2.0 * f32(d) / f32(rot));
     if ((params.flags & 1u) != 0u) {
         inv_freq = inv_freq / b[d];
     }
@@ -410,8 +515,21 @@ fn rope_half(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = rem % params.n_heads;
     let s = rem / params.n_heads;
     let base = (s * params.n_heads + h) * params.head_dim;
+    // Partial rotary: rotate-half pairs are (i, i+rot/2) within the
+    // rotated span; dims past it copy through.
+    let rot = select(params.head_dim, params.n, params.n != 0u);
+    let rhalf = rot / 2u;
+    if (d >= rhalf) {
+        // Threads past the rotated pairs each copy two pass-through
+        // dims: [rot, head_dim) split evenly across (half - rhalf)
+        // threads. (Both widths are even, so the split is exact.)
+        let j = base + rot + 2u * (d - rhalf);
+        out[j] = a[j];
+        out[j + 1u] = a[j + 1u];
+        return;
+    }
     let pos = f32(params.pos0 + s) * params.fscale;
-    var inv_freq = pow(params.theta, -2.0 * f32(d) / f32(params.head_dim));
+    var inv_freq = pow(params.theta, -2.0 * f32(d) / f32(rot));
     if ((params.flags & 1u) != 0u) {
         inv_freq = inv_freq / b[d];
     }
@@ -419,9 +537,9 @@ fn rope_half(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cw = cos(angle);
     let sn = sin(angle);
     let x0 = a[base + d];
-    let x1 = a[base + d + half];
-    out[base + d]        = x0 * cw - x1 * sn;
-    out[base + d + half] = x0 * sn + x1 * cw;
+    let x1 = a[base + d + rhalf];
+    out[base + d]         = x0 * cw - x1 * sn;
+    out[base + d + rhalf] = x0 * sn + x1 * cw;
 }
 
 // Causal attention scores with GQA:

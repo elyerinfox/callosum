@@ -290,7 +290,8 @@ impl ClipTextTransformer {
     pub fn new(vs: callosum_nn::VarBuilder, c: &ClipTextConfig) -> Result<Self> {
         let embeddings = ClipTextEmbeddings::new(vs.pp("embeddings"), c)?;
         let encoder = ClipEncoder::new(vs.pp("encoder"), &EncoderConfig::Text(c.clone()))?;
-        let final_layer_norm = callosum_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("final_layer_norm"))?;
+        let final_layer_norm =
+            callosum_nn::layer_norm(c.embed_dim, 1e-5, vs.pp("final_layer_norm"))?;
         Ok(ClipTextTransformer {
             embeddings,
             encoder,
