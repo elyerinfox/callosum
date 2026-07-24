@@ -132,3 +132,42 @@ fn softmax_matches_cpu() {
         assert!((s - 1.0).abs() < 1e-4, "row {r} sums to {s}");
     }
 }
+
+#[test]
+fn dedup_keeps_identical_cards_apart() {
+    use callosum_wgpu::{dedup_adapter_indices, AdapterDesc};
+    let mk = |index, name: &str, backend: &str, device_type: &str| AdapterDesc {
+        index,
+        name: name.into(),
+        vendor: "Intel".into(),
+        backend: backend.into(),
+        device_type: device_type.into(),
+    };
+    // 3 identical Arcs, each listed under Vulkan AND DX12, plus a
+    // software rasterizer: dedup must keep exactly the 3 Vulkan
+    // entries and drop everything else.
+    let adapters = vec![
+        mk(0, "Intel(R) Arc(TM) A770", "Vulkan", "DiscreteGpu"),
+        mk(1, "Intel(R) Arc(TM) A770", "Vulkan", "DiscreteGpu"),
+        mk(2, "Intel(R) Arc(TM) A770", "Vulkan", "DiscreteGpu"),
+        mk(3, "Intel(R) Arc(TM) A770", "Dx12", "DiscreteGpu"),
+        mk(4, "Intel(R) Arc(TM) A770", "Dx12", "DiscreteGpu"),
+        mk(5, "Intel(R) Arc(TM) A770", "Dx12", "DiscreteGpu"),
+        mk(6, "Microsoft Basic Render Driver", "Dx12", "Cpu"),
+    ];
+    assert_eq!(dedup_adapter_indices(&adapters), vec![0, 1, 2]);
+
+    // Mixed box: NVIDIA (Vulkan+DX12) + AMD iGPU (Vulkan+DX12) keeps
+    // one Vulkan entry per card.
+    let adapters = vec![
+        mk(0, "AMD Radeon(TM) Graphics", "Vulkan", "IntegratedGpu"),
+        mk(1, "NVIDIA GeForce RTX 3090", "Vulkan", "DiscreteGpu"),
+        mk(2, "AMD Radeon(TM) Graphics", "Dx12", "IntegratedGpu"),
+        mk(3, "NVIDIA GeForce RTX 3090", "Dx12", "DiscreteGpu"),
+        mk(4, "Microsoft Basic Render Driver", "Dx12", "Cpu"),
+        // GL mangles the device name, so it can't be name-grouped with
+        // its Vulkan twin — it must be excluded outright.
+        mk(5, "NVIDIA GeForce RTX 3090/PCIe/SSE2", "Gl", "DiscreteGpu"),
+    ];
+    assert_eq!(dedup_adapter_indices(&adapters), vec![0, 1]);
+}

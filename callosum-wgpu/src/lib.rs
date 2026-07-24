@@ -218,6 +218,75 @@ pub fn default_adapter_index() -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Rank a backend string for dedup preference (lower = better).
+fn backend_rank(b: &str) -> usize {
+    match b {
+        "Vulkan" => 0,
+        "Metal" => 1,
+        "Dx12" => 2,
+        _ => 3,
+    }
+}
+
+/// Pick one enumeration entry per *physical* adapter. The same card
+/// shows up once per API backend (Vulkan + DX12 on Windows); identical
+/// cards (3× the same Arc) are distinct entries within one backend's
+/// enumeration. Grouping by (name, device_type, backend) and keeping
+/// every entry of the best-ranked backend present for that name keeps
+/// k physical cards as k entries. Software rasterizers are dropped.
+pub fn dedup_adapter_indices(adapters: &[AdapterDesc]) -> Vec<usize> {
+    use std::collections::HashMap;
+    // name/type -> best backend rank seen.
+    let mut best: HashMap<(&str, &str), usize> = HashMap::new();
+    // GL entries are always redundant listings of a device the Vulkan
+    // or DX12 path already covers — and they mangle the name
+    // ("RTX 3090/PCIe/SSE2"), so name-grouping can't pair them with
+    // their twin. Drop them outright, like software rasterizers.
+    let skip = |a: &AdapterDesc| a.device_type == "Cpu" || a.backend == "Gl";
+    for a in adapters {
+        if skip(a) {
+            continue;
+        }
+        let key = (a.name.as_str(), a.device_type.as_str());
+        let r = backend_rank(&a.backend);
+        best.entry(key)
+            .and_modify(|cur| *cur = (*cur).min(r))
+            .or_insert(r);
+    }
+    adapters
+        .iter()
+        .filter(|a| {
+            !skip(a)
+                && best
+                    .get(&(a.name.as_str(), a.device_type.as_str()))
+                    .is_some_and(|&r| backend_rank(&a.backend) == r)
+        })
+        .map(|a| a.index)
+        .collect()
+}
+
+/// Every distinct physical adapter worth computing on, discrete cards
+/// first — what a serving layer should open under an "all adapters"
+/// policy.
+pub fn usable_adapters() -> Vec<AdapterDesc> {
+    let all = enumerate_adapters();
+    let mut keep: Vec<AdapterDesc> = dedup_adapter_indices(&all)
+        .into_iter()
+        .map(|i| all[i].clone())
+        .collect();
+    keep.sort_by_key(|a| {
+        (
+            match a.device_type.as_str() {
+                "DiscreteGpu" => 0usize,
+                "IntegratedGpu" => 1,
+                _ => 2,
+            },
+            a.index,
+        )
+    });
+    keep
+}
+
 /// Resolve a human adapter selector to an index: a decimal string is
 /// an explicit index, anything else is a case-insensitive substring
 /// matched against name/vendor/backend (ties broken discrete-first).
