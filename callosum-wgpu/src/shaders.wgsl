@@ -17,6 +17,14 @@ struct Params {
     head_dim: u32,
     theta: f32,
     scale: f32,
+    // Sliding-window size for attn_scores (0 = full causal).
+    window: u32,
+    // RoPE position scale (linear rope scaling); 1.0 = off.
+    fscale: f32,
+    // Soft-cap constant for `softcap` (tanh(x/cap)*cap).
+    cap: f32,
+    // Bit 0: rope divides inv_freq by the freq-factor table in `b`.
+    flags: u32,
     _pad: u32,
 };
 
@@ -24,6 +32,10 @@ struct Params {
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+// Auxiliary read-only input for kernels needing a third tensor (MoE
+// routing tables). Kernels that ignore it get a dummy binding; the
+// shared explicit bind-group layout keeps the shape stable.
+@group(0) @binding(4) var<storage, read> c: array<f32>;
 
 // C[m,n] = A[m,k] × B[k,n]
 @compute @workgroup_size(16, 16, 1)
@@ -93,6 +105,141 @@ fn silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x = a[i];
         out[i] = (x / (1.0 + exp(-x))) * b[i];
     }
+}
+
+// Tanh-approximation GELU — must match callosum-core's `gelu` unary
+// (0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))), which the CUDA gemma path
+// uses for the FFN and AltUp gates.
+fn gelu_tanh(x: f32) -> f32 {
+    let x3 = x * x * x;
+    // Clamp: tanh saturates by |t| ~ 10, but some drivers (AMD Vulkan)
+    // compute tanh via exp and return NaN once exp overflows f32
+    // (|t| > ~44). Gemma activations reach 1e4+, so this bites hard.
+    let t = clamp(0.7978845608028654 * (x + 0.044715 * x3), -20.0, 20.0);
+    return 0.5 * x * (1.0 + tanh(t));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.len) {
+        out[i] = gelu_tanh(a[i]);
+    }
+}
+
+// out = gelu(a) * b — fused GeGLU elementwise (gemma FFN).
+@compute @workgroup_size(256, 1, 1)
+fn gelu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.len) {
+        out[i] = gelu_tanh(a[i]) * b[i];
+    }
+}
+
+// out[r, col] = a[r, col] * b[col] — row-broadcast multiply (AltUp
+// layer_output_scale).
+@compute @workgroup_size(256, 1, 1)
+fn mul_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.len) {
+        out[i] = a[i] * b[i % params.n];
+    }
+}
+
+// out = cap * tanh(a / cap) — gemma 2 logit soft-capping.
+@compute @workgroup_size(256, 1, 1)
+fn softcap(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.len) {
+        // Same overflow-safe clamp as gelu_tanh.
+        out[i] = params.cap * tanh(clamp(a[i] / params.cap, -20.0, 20.0));
+    }
+}
+
+// MoE router top-k: a = router logits [m tokens, k experts]; out =
+// routing table [m, n_heads slots, 2] of (expert_id, weight). One
+// workgroup per token; a single thread does the (tiny) full-row
+// softmax, iterative top-k selection, and top-k renormalisation —
+// mirroring run_moe in the CUDA backend exactly.
+@compute @workgroup_size(1, 1, 1)
+fn moe_topk(@builtin(workgroup_id) wid: vec3<u32>) {
+    let t = wid.x;
+    if (t >= params.m) {
+        return;
+    }
+    let n_e = params.k;
+    let slots = params.n_heads;
+    let base = t * n_e;
+    var mx: f32 = -3.4e38;
+    for (var e: u32 = 0u; e < n_e; e = e + 1u) {
+        mx = max(mx, a[base + e]);
+    }
+    var denom: f32 = 0.0;
+    for (var e: u32 = 0u; e < n_e; e = e + 1u) {
+        denom = denom + exp(a[base + e] - mx);
+    }
+    var wsum: f32 = 0.0;
+    for (var s: u32 = 0u; s < slots; s = s + 1u) {
+        var best: u32 = 0u;
+        var best_v: f32 = -3.4e38;
+        for (var e: u32 = 0u; e < n_e; e = e + 1u) {
+            var taken = false;
+            for (var s2: u32 = 0u; s2 < s; s2 = s2 + 1u) {
+                if (u32(out[(t * slots + s2) * 2u]) == e) {
+                    taken = true;
+                }
+            }
+            if (!taken && a[base + e] > best_v) {
+                best_v = a[base + e];
+                best = e;
+            }
+        }
+        let p = exp(a[base + best] - mx) / denom;
+        out[(t * slots + s) * 2u] = f32(best);
+        out[(t * slots + s) * 2u + 1u] = p;
+        wsum = wsum + p;
+    }
+    if (wsum > 0.0) {
+        for (var s: u32 = 0u; s < slots; s = s + 1u) {
+            out[(t * slots + s) * 2u + 1u] = out[(t * slots + s) * 2u + 1u] / wsum;
+        }
+    }
+}
+
+// MoE combine: a = expert outputs [m tokens * n_heads slots, k hidden];
+// c = routing table [m, n_heads, 2]; out[t, h] = sum_s w(t,s)*a[t,s,h].
+@compute @workgroup_size(256, 1, 1)
+fn moe_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let hidden = params.k;
+    let total = params.m * hidden;
+    if (i >= total) {
+        return;
+    }
+    let t = i / hidden;
+    let h = i % hidden;
+    let slots = params.n_heads;
+    var acc: f32 = 0.0;
+    for (var s: u32 = 0u; s < slots; s = s + 1u) {
+        let w = c[(t * slots + s) * 2u + 1u];
+        acc = acc + w * a[(t * slots + s) * hidden + h];
+    }
+    out[i] = acc;
+}
+
+// Column slice: out[r, 0..n] = a[r, pos0..pos0+n] over m rows of
+// stride k — extracts one block's AltUp per-layer slice from the
+// packed [seq, n_layers*hidden_per_layer] tensor.
+@compute @workgroup_size(256, 1, 1)
+fn slice_cols(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let total = params.m * params.n;
+    if (i >= total) {
+        return;
+    }
+    let r = i / params.n;
+    let j = i % params.n;
+    out[i] = a[r * params.k + params.pos0 + j];
 }
 
 var<workgroup> scratch: array<f32, 256>;
@@ -234,15 +381,18 @@ fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = rem % params.n_heads;
     let s = rem / params.n_heads;
     let base = (s * params.n_heads + h) * params.head_dim;
-    let pos = f32(params.pos0 + s);
-    let inv_freq = pow(params.theta, -2.0 * f32(d) / f32(params.head_dim));
+    let pos = f32(params.pos0 + s) * params.fscale;
+    var inv_freq = pow(params.theta, -2.0 * f32(d) / f32(params.head_dim));
+    if ((params.flags & 1u) != 0u) {
+        inv_freq = inv_freq / b[d];
+    }
     let angle = pos * inv_freq;
-    let c = cos(angle);
+    let cw = cos(angle);
     let sn = sin(angle);
     let x0 = a[base + 2u * d];
     let x1 = a[base + 2u * d + 1u];
-    out[base + 2u * d]      = x0 * c - x1 * sn;
-    out[base + 2u * d + 1u] = x0 * sn + x1 * c;
+    out[base + 2u * d]      = x0 * cw - x1 * sn;
+    out[base + 2u * d + 1u] = x0 * sn + x1 * cw;
 }
 
 // Rotate-half ("neox") RoPE (Qwen/Gemma/Phi convention): pairs
@@ -260,15 +410,18 @@ fn rope_half(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = rem % params.n_heads;
     let s = rem / params.n_heads;
     let base = (s * params.n_heads + h) * params.head_dim;
-    let pos = f32(params.pos0 + s);
-    let inv_freq = pow(params.theta, -2.0 * f32(d) / f32(params.head_dim));
+    let pos = f32(params.pos0 + s) * params.fscale;
+    var inv_freq = pow(params.theta, -2.0 * f32(d) / f32(params.head_dim));
+    if ((params.flags & 1u) != 0u) {
+        inv_freq = inv_freq / b[d];
+    }
     let angle = pos * inv_freq;
-    let c = cos(angle);
+    let cw = cos(angle);
     let sn = sin(angle);
     let x0 = a[base + d];
     let x1 = a[base + d + half];
-    out[base + d]        = x0 * c - x1 * sn;
-    out[base + d + half] = x0 * sn + x1 * c;
+    out[base + d]        = x0 * cw - x1 * sn;
+    out[base + d + half] = x0 * sn + x1 * cw;
 }
 
 // Causal attention scores with GQA:
@@ -288,6 +441,10 @@ fn attn_scores(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sq = rem % params.m;
     let h = rem / params.m;
     if (sk > params.pos0 + sq) {
+        out[idx] = -3.0e38;
+        return;
+    }
+    if (params.window > 0u && sk + params.window <= params.pos0 + sq) {
         out[idx] = -3.0e38;
         return;
     }

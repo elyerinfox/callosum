@@ -13,6 +13,7 @@
 //! every op lands with a parity test before it's reachable from model
 //! code.
 
+pub mod gemma;
 pub mod llama;
 
 use std::sync::Arc;
@@ -87,6 +88,16 @@ struct Pipelines {
     add: wgpu::ComputePipeline,
     add_bias: wgpu::ComputePipeline,
     mul: wgpu::ComputePipeline,
+    mul_bias: wgpu::ComputePipeline,
+    gelu: wgpu::ComputePipeline,
+    gelu_mul: wgpu::ComputePipeline,
+    softcap: wgpu::ComputePipeline,
+    slice_cols: wgpu::ComputePipeline,
+    moe_topk: wgpu::ComputePipeline,
+    moe_combine: wgpu::ComputePipeline,
+    /// Per-format expert-indexed matmul (MoE), plus an f32 fallback.
+    expert: std::collections::HashMap<QuantDtype, wgpu::ComputePipeline>,
+    expert_f32: wgpu::ComputePipeline,
     silu: wgpu::ComputePipeline,
     rms_norm: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
@@ -133,7 +144,7 @@ struct DeviceInner {
     /// pooled buffers the same combinations recur every token, so this
     /// converges to a full hit rate after the first forward.
     bind_cache: std::sync::Mutex<
-        std::collections::HashMap<(u64, u64, u64, u64), std::sync::Arc<wgpu::BindGroup>>,
+        std::collections::HashMap<(u64, u64, u64, u64, u64), std::sync::Arc<wgpu::BindGroup>>,
     >,
     pub info: AdapterDesc,
 }
@@ -180,6 +191,10 @@ struct Params {
     head_dim: u32,
     theta: f32,
     scale: f32,
+    window: u32,
+    fscale: f32,
+    cap: f32,
+    flags: u32,
     _pad: u32,
 }
 
@@ -336,6 +351,7 @@ impl WgpuDevice {
                     },
                     count: None,
                 },
+                storage_ro(4),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -354,9 +370,11 @@ impl WgpuDevice {
             })
         };
         let mut quant = std::collections::HashMap::new();
+        let mut expert = std::collections::HashMap::new();
         for fmt in QuantDtype::ALL {
             quant.insert((fmt, false), mk(&format!("matmul_t_{}", fmt.fn_suffix())));
             quant.insert((fmt, true), mk(&format!("matvec_{}", fmt.fn_suffix())));
+            expert.insert(fmt, mk(&format!("matmul_exp_{}", fmt.fn_suffix())));
         }
         let pipelines = Pipelines {
             matmul: mk("matmul"),
@@ -366,6 +384,15 @@ impl WgpuDevice {
             add: mk("add"),
             add_bias: mk("add_bias"),
             mul: mk("mul"),
+            mul_bias: mk("mul_bias"),
+            gelu: mk("gelu"),
+            gelu_mul: mk("gelu_mul"),
+            softcap: mk("softcap"),
+            slice_cols: mk("slice_cols"),
+            moe_topk: mk("moe_topk"),
+            moe_combine: mk("moe_combine"),
+            expert,
+            expert_f32: mk("matmul_exp_f32"),
             silu: mk("silu"),
             rms_norm: mk("rms_norm"),
             softmax: mk("softmax"),
@@ -473,11 +500,15 @@ impl WgpuDevice {
         Ok(out)
     }
 
-    fn dispatch(
+    /// Three-input dispatch; kernels that ignore the auxiliary `c`
+    /// binding go through [`Self::dispatch`], which re-binds `a` there.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch4(
         &self,
         pipeline: &wgpu::ComputePipeline,
         a: &GpuBuffer,
         b: &GpuBuffer,
+        c: &GpuBuffer,
         out: &GpuBuffer,
         params: Params,
         groups: (u32, u32, u32),
@@ -502,7 +533,7 @@ impl WgpuDevice {
         self.inner
             .queue
             .write_buffer(&pbuf, 0, bytemuck::bytes_of(&params));
-        let key = (a.id, b.id, out.id, uslot | (1u64 << 63));
+        let key = (a.id, b.id, c.id, out.id, uslot | (1u64 << 63));
         let bind = {
             let mut cache = self.inner.bind_cache.lock().unwrap();
             cache
@@ -528,6 +559,10 @@ impl WgpuDevice {
                                 binding: 3,
                                 resource: pbuf.as_entire_binding(),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: c.buf.as_entire_binding(),
+                            },
                         ],
                     }))
                 })
@@ -550,6 +585,18 @@ impl WgpuDevice {
             }
             self.inner.queue.submit([enc.finish()]);
         }
+    }
+
+    fn dispatch(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        out: &GpuBuffer,
+        params: Params,
+        groups: (u32, u32, u32),
+    ) {
+        self.dispatch4(pipeline, a, b, a, out, params, groups);
     }
 
     /// Start recording ops into a single command buffer. Ends at
@@ -666,6 +713,241 @@ impl WgpuDevice {
             return Err(WgpuError::Shape("mul: length mismatch".into()));
         }
         self.elementwise(&self.inner.pipelines.mul, a, b)
+    }
+
+    /// out[r, c] = a[r, c] * bias[c] over rows of width `bias.len`.
+    pub fn mul_bias(&self, a: &GpuBuffer, bias: &GpuBuffer) -> Result<GpuBuffer> {
+        if bias.len == 0 || !a.len.is_multiple_of(bias.len) {
+            return Err(WgpuError::Shape("mul_bias: shape mismatch".into()));
+        }
+        let out = self.alloc_out(a.len);
+        let params = Params {
+            len: a.len as u32,
+            n: bias.len as u32,
+            ..Default::default()
+        };
+        let groups = (a.len as u32).div_ceil(256);
+        self.dispatch(
+            &self.inner.pipelines.mul_bias,
+            a,
+            bias,
+            &out,
+            params,
+            (groups, 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// Tanh-approximation GELU (matches callosum-core's `gelu` unary).
+    pub fn gelu(&self, a: &GpuBuffer) -> Result<GpuBuffer> {
+        self.elementwise(&self.inner.pipelines.gelu, a, a)
+    }
+
+    /// out = gelu(gate) * up — fused GeGLU (gemma FFN).
+    pub fn gelu_mul(&self, gate: &GpuBuffer, up: &GpuBuffer) -> Result<GpuBuffer> {
+        if gate.len != up.len {
+            return Err(WgpuError::Shape("gelu_mul: length mismatch".into()));
+        }
+        self.elementwise(&self.inner.pipelines.gelu_mul, gate, up)
+    }
+
+    /// out = cap * tanh(a / cap) — gemma-2 logit soft-capping.
+    pub fn softcap(&self, a: &GpuBuffer, cap: f32) -> Result<GpuBuffer> {
+        let out = self.alloc_out(a.len);
+        let params = Params {
+            len: a.len as u32,
+            cap,
+            ..Default::default()
+        };
+        let groups = (a.len as u32).div_ceil(256);
+        self.dispatch(
+            &self.inner.pipelines.softcap,
+            a,
+            a,
+            &out,
+            params,
+            (groups, 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// out[r, 0..width] = a[r, off..off+width] over `rows` rows of
+    /// stride `stride` — a strided column slice.
+    pub fn slice_cols(
+        &self,
+        a: &GpuBuffer,
+        rows: usize,
+        stride: usize,
+        off: usize,
+        width: usize,
+    ) -> Result<GpuBuffer> {
+        if a.len != rows * stride || off + width > stride {
+            return Err(WgpuError::Shape("slice_cols: shape mismatch".into()));
+        }
+        let out = self.alloc_out(rows * width);
+        let params = Params {
+            m: rows as u32,
+            k: stride as u32,
+            n: width as u32,
+            pos0: off as u32,
+            ..Default::default()
+        };
+        let groups = ((rows * width) as u32).div_ceil(256);
+        self.dispatch(
+            &self.inner.pipelines.slice_cols,
+            a,
+            a,
+            &out,
+            params,
+            (groups, 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// MoE routing: full-axis softmax over `logits` [m, n_experts],
+    /// iterative top-`slots` selection, weights renormalised over the
+    /// selected set. Returns [m, slots, 2] rows of (expert_id, weight).
+    pub fn moe_topk(
+        &self,
+        logits: &GpuBuffer,
+        m: usize,
+        n_experts: usize,
+        slots: usize,
+    ) -> Result<GpuBuffer> {
+        if logits.len != m * n_experts || slots == 0 || slots > n_experts {
+            return Err(WgpuError::Shape("moe_topk: shape mismatch".into()));
+        }
+        let out = self.alloc_out(m * slots * 2);
+        let params = Params {
+            m: m as u32,
+            k: n_experts as u32,
+            n_heads: slots as u32,
+            ..Default::default()
+        };
+        self.dispatch(
+            &self.inner.pipelines.moe_topk,
+            logits,
+            logits,
+            &out,
+            params,
+            (m as u32, 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// Expert-indexed matmul over a fused quantized expert tensor
+    /// (`w` holds n_experts × rows stacked row-major). For every
+    /// (token, slot) pair in `routing` ([m, slots, 2]), computes
+    /// x[token] · W[expert]ᵀ into out[(token*slots+slot), rows].
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_expert(
+        &self,
+        x: &GpuBuffer,
+        w: &QuantBuffer,
+        routing: &GpuBuffer,
+        m: usize,
+        slots: usize,
+        rows_per_expert: usize,
+        k: usize,
+        x_per_slot: bool,
+    ) -> Result<GpuBuffer> {
+        let want_x = if x_per_slot { m * slots * k } else { m * k };
+        if x.len != want_x || w.k != k || routing.len != m * slots * 2 {
+            return Err(WgpuError::Shape("matmul_expert: shape mismatch".into()));
+        }
+        let out = self.alloc_out(m * slots * rows_per_expert);
+        let params = Params {
+            m: m as u32,
+            n: rows_per_expert as u32,
+            k: k as u32,
+            len: w.row_words as u32,
+            n_heads: slots as u32,
+            flags: if x_per_slot { 1 } else { 0 },
+            ..Default::default()
+        };
+        let pipeline = &self.inner.pipelines.expert[&w.dtype];
+        self.dispatch4(
+            pipeline,
+            x,
+            &w.buf,
+            routing,
+            &out,
+            params,
+            matvec_groups(m * slots * rows_per_expert),
+        );
+        Ok(out)
+    }
+
+    /// f32 fallback of [`Self::matmul_expert`] for expert tensors in
+    /// formats without an in-shader dequant kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_expert_f32(
+        &self,
+        x: &GpuBuffer,
+        w: &GpuBuffer,
+        routing: &GpuBuffer,
+        m: usize,
+        slots: usize,
+        rows_per_expert: usize,
+        k: usize,
+        x_per_slot: bool,
+    ) -> Result<GpuBuffer> {
+        let want_x = if x_per_slot { m * slots * k } else { m * k };
+        if x.len != want_x || routing.len != m * slots * 2 {
+            return Err(WgpuError::Shape("matmul_expert_f32: shape mismatch".into()));
+        }
+        let out = self.alloc_out(m * slots * rows_per_expert);
+        let params = Params {
+            m: m as u32,
+            n: rows_per_expert as u32,
+            k: k as u32,
+            n_heads: slots as u32,
+            flags: if x_per_slot { 1 } else { 0 },
+            ..Default::default()
+        };
+        self.dispatch4(
+            &self.inner.pipelines.expert_f32,
+            x,
+            w,
+            routing,
+            &out,
+            params,
+            matvec_groups(m * slots * rows_per_expert),
+        );
+        Ok(out)
+    }
+
+    /// Weighted sum of per-slot expert outputs back onto tokens:
+    /// out[t, h] = Σ_s routing_weight(t, s) · y[(t*slots+s), h].
+    pub fn moe_combine(
+        &self,
+        y: &GpuBuffer,
+        routing: &GpuBuffer,
+        m: usize,
+        slots: usize,
+        hidden: usize,
+    ) -> Result<GpuBuffer> {
+        if y.len != m * slots * hidden || routing.len != m * slots * 2 {
+            return Err(WgpuError::Shape("moe_combine: shape mismatch".into()));
+        }
+        let out = self.alloc_out(m * hidden);
+        let params = Params {
+            m: m as u32,
+            k: hidden as u32,
+            n_heads: slots as u32,
+            ..Default::default()
+        };
+        let groups = ((m * hidden) as u32).div_ceil(256);
+        self.dispatch4(
+            &self.inner.pipelines.moe_combine,
+            y,
+            y,
+            routing,
+            &out,
+            params,
+            (groups, 1, 1),
+        );
+        Ok(out)
     }
 
     pub fn silu(&self, a: &GpuBuffer) -> Result<GpuBuffer> {
@@ -887,6 +1169,7 @@ impl WgpuDevice {
             head_dim: head_dim as u32,
             pos0: pos0 as u32,
             theta,
+            fscale: 1.0,
             ..Default::default()
         };
         let pairs = (seq * heads * head_dim / 2) as u32;
@@ -896,6 +1179,58 @@ impl WgpuDevice {
             &self.inner.pipelines.rope_half
         };
         self.dispatch(pipeline, x, x, &out, params, (pairs.div_ceil(256), 1, 1));
+        Ok(out)
+    }
+
+    /// RoPE with the full option set: linear position scale (`fscale`,
+    /// 1.0 = off) and optional per-frequency divisors (`freqs`, length
+    /// head_dim/2 — gemma's `rope_freqs.weight`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_scaled(
+        &self,
+        x: &GpuBuffer,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        pos0: usize,
+        theta: f32,
+        interleaved: bool,
+        fscale: f32,
+        freqs: Option<&GpuBuffer>,
+    ) -> Result<GpuBuffer> {
+        if x.len != seq * heads * head_dim {
+            return Err(WgpuError::Shape("rope: shape mismatch".into()));
+        }
+        if let Some(f) = freqs {
+            if f.len < head_dim / 2 {
+                return Err(WgpuError::Shape("rope: freq table too short".into()));
+            }
+        }
+        let out = self.alloc_out(x.len);
+        let params = Params {
+            m: seq as u32,
+            n_heads: heads as u32,
+            head_dim: head_dim as u32,
+            pos0: pos0 as u32,
+            theta,
+            fscale,
+            flags: if freqs.is_some() { 1 } else { 0 },
+            ..Default::default()
+        };
+        let pairs = (seq * heads * head_dim / 2) as u32;
+        let pipeline = if interleaved {
+            &self.inner.pipelines.rope_interleaved
+        } else {
+            &self.inner.pipelines.rope_half
+        };
+        self.dispatch(
+            pipeline,
+            x,
+            freqs.unwrap_or(x),
+            &out,
+            params,
+            (pairs.div_ceil(256), 1, 1),
+        );
         Ok(out)
     }
 
@@ -914,6 +1249,28 @@ impl WgpuDevice {
         head_dim: usize,
         pos0: usize,
     ) -> Result<GpuBuffer> {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        self.attn_scores_opt(
+            q, k_cache, seq_q, kv_len, heads, kv_heads, head_dim, pos0, scale, 0,
+        )
+    }
+
+    /// [`Self::attn_scores`] with an explicit scale (gemma 3n/4 use 1.0)
+    /// and an optional sliding window (0 = full causal).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_scores_opt(
+        &self,
+        q: &GpuBuffer,
+        k_cache: &GpuBuffer,
+        seq_q: usize,
+        kv_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos0: usize,
+        scale: f32,
+        window: usize,
+    ) -> Result<GpuBuffer> {
         if q.len != seq_q * heads * head_dim || k_cache.len < kv_len * kv_heads * head_dim {
             return Err(WgpuError::Shape("attn_scores: shape mismatch".into()));
         }
@@ -925,7 +1282,8 @@ impl WgpuDevice {
             n_kv_heads: kv_heads as u32,
             head_dim: head_dim as u32,
             pos0: pos0 as u32,
-            scale: 1.0 / (head_dim as f32).sqrt(),
+            scale,
+            window: window as u32,
             ..Default::default()
         };
         let total = (heads * seq_q * kv_len) as u32;
@@ -1194,6 +1552,54 @@ fn matvec_{f}(
         out[col] = scratch[0];
     }}
 }}
+
+// Expert-indexed matmul (MoE): output element oi covers
+// [m tokens × n_heads slots × n rows]; the expert id for (token, slot)
+// comes from the routing table in `c`. Weight rows for expert e start
+// at row e*n of the fused [n_experts*n, k] quantized tensor.
+@compute @workgroup_size(256, 1, 1)
+fn matmul_exp_{f}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let oi = wid.y * 32768u + wid.x;
+    let total = params.m * params.n_heads * params.n;
+    if (oi >= total) {{
+        return;
+    }}
+    let col = oi % params.n;
+    let ts = oi / params.n;
+    let t = ts / params.n_heads;
+    // flags bit 0: input rows are per-(token, slot) — the down
+    // projection consumes the per-slot SwiGLU outputs — instead of
+    // per-token.
+    let xrow = select(t, ts, (params.flags & 1u) != 0u);
+    let eid = u32(c[ts * 2u]);
+    let units = params.k / 32u;
+    let row_word = (eid * params.n + col) * params.len;
+    var acc: f32 = 0.0;
+    var u = lid.x;
+    loop {{
+        if (u >= units) {{
+            break;
+        }}
+        acc = acc + dot_{f}(row_word, u, xrow * params.k + u * 32u);
+        u = u + 256u;
+    }}
+    scratch[lid.x] = acc;
+    workgroupBarrier();
+    var stride2: u32 = 128u;
+    while (stride2 > 0u) {{
+        if (lid.x < stride2) {{
+            scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride2];
+        }}
+        workgroupBarrier();
+        stride2 = stride2 / 2u;
+    }}
+    if (lid.x == 0u) {{
+        out[ts * params.n + col] = scratch[0];
+    }}
+}}
 "#
     )
 }
@@ -1246,6 +1652,48 @@ fn matvec_f32(
     }
     if (lid.x == 0u && col < params.n) {
         out[col] = scratch[0];
+    }
+}
+
+// f32 fallback of the expert-indexed matmul: `b` is the dense
+// [n_experts * n, k] weight, `c` the routing table.
+@compute @workgroup_size(256, 1, 1)
+fn matmul_exp_f32(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let oi = wid.y * 32768u + wid.x;
+    let total = params.m * params.n_heads * params.n;
+    if (oi >= total) {
+        return;
+    }
+    let col = oi % params.n;
+    let ts = oi / params.n;
+    let t = ts / params.n_heads;
+    let xrow = select(t, ts, (params.flags & 1u) != 0u);
+    let eid = u32(c[ts * 2u]);
+    let row_base = (eid * params.n + col) * params.k;
+    var acc: f32 = 0.0;
+    var i = lid.x;
+    loop {
+        if (i >= params.k) {
+            break;
+        }
+        acc = acc + b[row_base + i] * a[xrow * params.k + i];
+        i = i + 256u;
+    }
+    scratch[lid.x] = acc;
+    workgroupBarrier();
+    var stride: u32 = 128u;
+    while (stride > 0u) {
+        if (lid.x < stride) {
+            scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid.x == 0u) {
+        out[ts * params.n + col] = scratch[0];
     }
 }
 "#;

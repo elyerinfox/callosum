@@ -48,6 +48,9 @@ pub struct LlamaConfig {
     /// Llama/Mistral/SmolLM2 use interleaved RoPE pairs; qwen-style
     /// GGUFs set false (rotate-half).
     pub rope_interleaved: bool,
+    /// MoE expert counts (qwen3moe). 0 for dense models.
+    pub n_experts: usize,
+    pub n_experts_used: usize,
 }
 
 enum Weight {
@@ -71,6 +74,95 @@ impl Weight {
     }
 }
 
+/// Host-resident quantized row-lookup table. Embedding tables live
+/// here instead of VRAM: dequantized to f32 they can exceed
+/// max_storage_buffer_binding_size (gemma-2's 256k x 2304 table is
+/// 2.36 GB), and an input-side gather only ever needs `seq` rows per
+/// forward — dequantized on the CPU in microseconds.
+pub(crate) struct HostRowTable {
+    raw: Vec<u8>,
+    dtype: GgmlDType,
+    row_bytes: usize,
+    pub(crate) rows_total: usize,
+    pub(crate) cols: usize,
+}
+
+impl HostRowTable {
+    pub(crate) fn from_qtensor(qt: &callosum::quantized::QTensor) -> Result<Self> {
+        let dims = qt.shape().dims().to_vec();
+        if dims.len() != 2 {
+            return Err(WgpuError::Shape(format!(
+                "row table must be rank-2, got {dims:?}"
+            )));
+        }
+        let (rows_total, cols) = (dims[0], dims[1]);
+        let dtype = qt.dtype();
+        if cols % dtype.block_size() != 0 {
+            return Err(WgpuError::Shape(format!(
+                "row table row of {cols} not block-aligned for {dtype:?}"
+            )));
+        }
+        let row_bytes = cols / dtype.block_size() * dtype.type_size();
+        let raw = qt
+            .data()
+            .map_err(|e| WgpuError::Device(format!("row table bytes: {e}")))?
+            .into_owned();
+        Ok(Self {
+            raw,
+            dtype,
+            row_bytes,
+            rows_total,
+            cols,
+        })
+    }
+
+    /// Dequantize the given rows on the CPU, concatenated row-major.
+    pub(crate) fn rows(&self, ids: &[u32]) -> Result<Vec<f32>> {
+        use callosum::quantized::{QStorage, QTensor};
+        let cpu = callosum::Device::Cpu;
+        let mut out: Vec<f32> = Vec::with_capacity(ids.len() * self.cols);
+        for &id in ids {
+            let off = id as usize * self.row_bytes;
+            let slice = self
+                .raw
+                .get(off..off + self.row_bytes)
+                .ok_or_else(|| WgpuError::Shape(format!("row id {id} out of table range")))?;
+            let storage = QStorage::from_data(std::borrow::Cow::Borrowed(slice), &cpu, self.dtype)
+                .map_err(|e| WgpuError::Device(format!("row {id} storage: {e}")))?;
+            let row = QTensor::new(storage, (1, self.cols))
+                .and_then(|t| t.dequantize(&cpu))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| WgpuError::Device(format!("row {id} dequant: {e}")))?;
+            out.extend(row);
+        }
+        Ok(out)
+    }
+}
+
+/// Dispatch an expert-indexed matmul on either weight representation.
+#[allow(clippy::too_many_arguments)]
+fn expert_matmul(
+    dev: &WgpuDevice,
+    w: &Weight,
+    x: &crate::GpuBuffer,
+    routing: &crate::GpuBuffer,
+    m: usize,
+    slots: usize,
+    rows_per_expert: usize,
+    k: usize,
+    x_per_slot: bool,
+) -> Result<crate::GpuBuffer> {
+    match w {
+        Weight::Quant(q) => {
+            dev.matmul_expert(x, q, routing, m, slots, rows_per_expert, k, x_per_slot)
+        }
+        Weight::F32 { buf, .. } => {
+            dev.matmul_expert_f32(x, buf, routing, m, slots, rows_per_expert, k, x_per_slot)
+        }
+    }
+}
+
 /// GGML dtypes with in-shader kernels; anything else dequantizes to
 /// f32 at load (correct, memory-expensive).
 fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
@@ -82,6 +174,29 @@ fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
         GgmlDType::Q6K => Some(QuantDtype::Q6K),
         _ => None,
     }
+}
+
+/// Dense SwiGLU or a mixture-of-experts FFN (qwen3moe). Expert weights
+/// stay fused and quantized on the GPU exactly as stored on disk; the
+/// expert-indexed matmul kernels dequantize the routed expert's rows
+/// in-shader.
+enum Ffn {
+    Dense {
+        gate: Weight,
+        up: Weight,
+        down: Weight,
+    },
+    Moe {
+        /// hidden → n_experts router.
+        router: Weight,
+        /// Fused [n_experts * ffn_dim, hidden].
+        gates: Weight,
+        /// Fused [n_experts * ffn_dim, hidden].
+        ups: Weight,
+        /// Fused [n_experts * hidden, ffn_dim].
+        downs: Weight,
+        ffn_dim: usize,
+    },
 }
 
 struct Block {
@@ -99,17 +214,15 @@ struct Block {
     q_norm: Option<GpuBuffer>,
     k_norm: Option<GpuBuffer>,
     ffn_norm: GpuBuffer,
-    gate: Weight,
-    up: Weight,
-    down: Weight,
+    ffn: Ffn,
 }
 
 pub struct WgpuLlama {
     dev: WgpuDevice,
     pub cfg: LlamaConfig,
-    /// f32 [vocab, hidden] gather source — present only on shards that
-    /// own the input globals.
-    embed: Option<GpuBuffer>,
+    /// Host-side quantized [vocab, hidden] gather source — present only
+    /// on shards that own the input globals.
+    embed: Option<HostRowTable>,
     blocks: Vec<Block>,
     /// Final norm + lm_head — present only on shards that own the
     /// output globals.
@@ -200,14 +313,18 @@ impl WgpuLlama {
             .and_then(|v| v.to_string().ok())
             .cloned()
             .unwrap_or_else(|| "llama".to_string());
-        if !matches!(arch.as_str(), "llama" | "mistral" | "qwen2" | "qwen3") {
+        if !matches!(
+            arch.as_str(),
+            "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35moe"
+        ) {
             return Err(WgpuError::Device(format!(
-                "callosum-wgpu llama loader supports llama/mistral/qwen2/qwen3 (got {arch:?})"
+                "callosum-wgpu llama loader supports llama/mistral/qwen2/qwen3/qwen3moe (got {arch:?})"
             )));
         }
         // Interleaved pairs (2i, 2i+1) for llama-lineage GGUFs,
         // rotate-half (i, i+d/2) for the qwen family.
         let rope_interleaved = matches!(arch.as_str(), "llama" | "mistral");
+        let is_moe = arch.ends_with("moe");
         let key = |suffix: &str| format!("{arch}.{suffix}");
 
         let hidden = meta_u32(&content, &[&key("embedding_length")])
@@ -226,6 +343,13 @@ impl WgpuLlama {
             .map(|v| v as usize)
             .unwrap_or(hidden / n_heads);
         let rope_theta = meta_f32(&content, &[&key("rope.freq_base")]).unwrap_or(10_000.0);
+        let n_experts = meta_u32(&content, &[&key("expert_count")]).unwrap_or(0) as usize;
+        let n_experts_used = meta_u32(&content, &[&key("expert_used_count")]).unwrap_or(0) as usize;
+        if is_moe && (n_experts == 0 || n_experts_used == 0) {
+            return Err(WgpuError::Device(
+                "MoE arch without expert_count/expert_used_count metadata".into(),
+            ));
+        }
         let rms_eps =
             meta_f32(&content, &[&key("attention.layer_norm_rms_epsilon")]).unwrap_or(1e-5);
 
@@ -257,9 +381,14 @@ impl WgpuLlama {
         let mut embed = None;
         let mut vocab = 0usize;
         if owns_input {
-            let (e, dims) = load_f32("token_embd.weight")?;
-            vocab = dims[0];
-            embed = Some(e);
+            let mut file_e = std::fs::File::open(path)
+                .map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
+            let qt = content
+                .tensor(&mut file_e, "token_embd.weight", &cpu)
+                .map_err(|e| WgpuError::Device(format!("load token_embd: {e}")))?;
+            let table = HostRowTable::from_qtensor(&qt)?;
+            vocab = table.rows_total;
+            embed = Some(table);
         }
 
         // Weight loader: supported quant formats stay quantized on the
@@ -301,6 +430,48 @@ impl WgpuLlama {
         };
 
         let has = |name: &str| content.tensor_infos.contains_key(name);
+        // Fused MoE expert tensors are rank-3 [n_experts, rows, cols];
+        // flatten to [n_experts * rows, cols] so one QuantBuffer holds
+        // every expert at on-disk density. The expert-indexed kernels
+        // offset by expert_id * rows.
+        let mut file3 =
+            std::fs::File::open(path).map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
+        let mut load_expert_weight = |name: &str| -> Result<Weight> {
+            let qt = content
+                .tensor(&mut file3, name, &cpu)
+                .map_err(|e| WgpuError::Device(format!("load {name}: {e}")))?;
+            let dims = qt.shape().dims().to_vec();
+            if dims.len() != 3 {
+                return Err(WgpuError::Shape(format!(
+                    "{name}: expected rank-3 fused experts"
+                )));
+            }
+            let (n_e, rows, cols) = (dims[0], dims[1], dims[2]);
+            match quant_dtype(qt.dtype()) {
+                Some(fmt) if cols % fmt.block_elems() == 0 => {
+                    let raw = qt
+                        .data()
+                        .map_err(|e| WgpuError::Device(format!("{name} bytes: {e}")))?;
+                    weight_bytes.set(weight_bytes.get() + raw.len() as u64);
+                    dev.upload_quantized(&raw, n_e * rows, cols, fmt)
+                        .map(Weight::Quant)
+                }
+                _ => {
+                    let t = qt
+                        .dequantize(&cpu)
+                        .and_then(|t| t.to_dtype(callosum::DType::F32))
+                        .and_then(|t| t.flatten_all())
+                        .and_then(|t| t.to_vec1::<f32>())
+                        .map_err(|e| WgpuError::Device(format!("dequantize {name}: {e}")))?;
+                    weight_bytes.set(weight_bytes.get() + (t.len() * 4) as u64);
+                    Ok(Weight::F32 {
+                        buf: dev.upload(&t),
+                        n: n_e * rows,
+                        k: cols,
+                    })
+                }
+            }
+        };
         let mut blocks = Vec::with_capacity(layer_end - layer_start);
         for b in layer_start..layer_end {
             let (attn_norm, _) = load_f32(&format!("blk.{b}.attn_norm.weight"))?;
@@ -317,6 +488,27 @@ impl WgpuLlama {
             let bv = opt_f32(format!("blk.{b}.attn_v.bias"))?;
             let q_norm = opt_f32(format!("blk.{b}.attn_q_norm.weight"))?;
             let k_norm = opt_f32(format!("blk.{b}.attn_k_norm.weight"))?;
+            let ffn = if has(&format!("blk.{b}.ffn_gate_inp.weight")) {
+                let gates = load_expert_weight(&format!("blk.{b}.ffn_gate_exps.weight"))?;
+                let ffn_dim = match &gates {
+                    // Fused rows = n_experts * ffn_dim.
+                    Weight::F32 { n, .. } => *n / n_experts,
+                    Weight::Quant(q) => q.n / n_experts,
+                };
+                Ffn::Moe {
+                    router: load_weight(&format!("blk.{b}.ffn_gate_inp.weight"))?,
+                    gates,
+                    ups: load_expert_weight(&format!("blk.{b}.ffn_up_exps.weight"))?,
+                    downs: load_expert_weight(&format!("blk.{b}.ffn_down_exps.weight"))?,
+                    ffn_dim,
+                }
+            } else {
+                Ffn::Dense {
+                    gate: load_weight(&format!("blk.{b}.ffn_gate.weight"))?,
+                    up: load_weight(&format!("blk.{b}.ffn_up.weight"))?,
+                    down: load_weight(&format!("blk.{b}.ffn_down.weight"))?,
+                }
+            };
             blocks.push(Block {
                 attn_norm,
                 wq: load_weight(&format!("blk.{b}.attn_q.weight"))?,
@@ -329,9 +521,7 @@ impl WgpuLlama {
                 q_norm,
                 k_norm,
                 ffn_norm,
-                gate: load_weight(&format!("blk.{b}.ffn_gate.weight"))?,
-                up: load_weight(&format!("blk.{b}.ffn_up.weight"))?,
-                down: load_weight(&format!("blk.{b}.ffn_down.weight"))?,
+                ffn,
             });
         }
 
@@ -368,6 +558,8 @@ impl WgpuLlama {
                 rope_theta,
                 rms_eps,
                 rope_interleaved,
+                n_experts,
+                n_experts_used,
             },
             embed,
             blocks,
@@ -463,9 +655,7 @@ impl WgpuLlama {
                 let embed = self.embed.as_ref().ok_or_else(|| {
                     WgpuError::Shape("token input on a shard without input globals".into())
                 })?;
-                let ids: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
-                let ids = self.dev.upload(&ids);
-                self.dev.embed_gather(&ids, embed, seq, cfg.hidden)?
+                self.dev.upload(&embed.rows(tokens)?)
             }
             StageInput::Hidden { data, seq } => {
                 if data.len() != seq * cfg.hidden {
@@ -554,10 +744,42 @@ impl WgpuLlama {
             let h2 = self
                 .dev
                 .rms_norm(&x, &blk.ffn_norm, seq, cfg.hidden, cfg.rms_eps)?;
-            let g = blk.gate.matmul_t(&self.dev, &h2, seq)?;
-            let u = blk.up.matmul_t(&self.dev, &h2, seq)?;
-            let gu = self.dev.silu_mul(&g, &u)?;
-            let d = blk.down.matmul_t(&self.dev, &gu, seq)?;
+            let d = match &blk.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    let g = gate.matmul_t(&self.dev, &h2, seq)?;
+                    let u = up.matmul_t(&self.dev, &h2, seq)?;
+                    let gu = self.dev.silu_mul(&g, &u)?;
+                    down.matmul_t(&self.dev, &gu, seq)?
+                }
+                Ffn::Moe {
+                    router,
+                    gates,
+                    ups,
+                    downs,
+                    ffn_dim,
+                } => {
+                    // Same routing rule as the CUDA backend's run_moe:
+                    // softmax over the FULL expert axis, top-k of the
+                    // probabilities, weights renormalised over the
+                    // selected set, SwiGLU per expert, weighted sum.
+                    let logits = router.matmul_t(&self.dev, &h2, seq)?;
+                    let routing =
+                        self.dev
+                            .moe_topk(&logits, seq, cfg.n_experts, cfg.n_experts_used)?;
+                    let slots = cfg.n_experts_used;
+                    let g = expert_matmul(
+                        &self.dev, gates, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden, false,
+                    )?;
+                    let u = expert_matmul(
+                        &self.dev, ups, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden, false,
+                    )?;
+                    let gu = self.dev.silu_mul(&g, &u)?;
+                    let d = expert_matmul(
+                        &self.dev, downs, &gu, &routing, seq, slots, cfg.hidden, *ffn_dim, true,
+                    )?;
+                    self.dev.moe_combine(&d, &routing, seq, slots, cfg.hidden)?
+                }
+            };
             x = self.dev.add(&x, &d)?;
         }
         session.len = kv_len;

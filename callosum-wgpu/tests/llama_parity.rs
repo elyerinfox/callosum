@@ -67,7 +67,8 @@ fn matmul_t_q8_0_matches_dequantized_reference() {
     // Quantize with callosum's own q8_0 encoder — the exact on-disk format.
     let cpu = callosum::Device::Cpu;
     let wt = callosum::Tensor::from_vec(w_dense.clone(), (n, k), &cpu).unwrap();
-    let qt = callosum::quantized::QTensor::quantize(&wt, callosum::quantized::GgmlDType::Q8_0).unwrap();
+    let qt =
+        callosum::quantized::QTensor::quantize(&wt, callosum::quantized::GgmlDType::Q8_0).unwrap();
     let raw = qt.data().unwrap();
     // CPU reference uses the DEQUANTIZED weights (what the shader must
     // reproduce bit-for-bit modulo f32 accumulation order).
@@ -303,10 +304,9 @@ fn wgpu_qwen3_matches_cpu_reference_tokens() {
     let cpu = callosum::Device::Cpu;
     let mut f = std::fs::File::open(&path).unwrap();
     let content = callosum::quantized::gguf_file::Content::read(&mut f).unwrap();
-    let mut cpu_model = callosum_models::models::quantized_qwen3::ModelWeights::from_gguf(
-        content, &mut f, &cpu,
-    )
-    .unwrap();
+    let mut cpu_model =
+        callosum_models::models::quantized_qwen3::ModelWeights::from_gguf(content, &mut f, &cpu)
+            .unwrap();
 
     let gpu_model = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();
     assert!(
@@ -381,10 +381,9 @@ fn wgpu_qwen2_matches_cpu_reference_tokens() {
     let cpu = callosum::Device::Cpu;
     let mut f = std::fs::File::open(&path).unwrap();
     let content = callosum::quantized::gguf_file::Content::read(&mut f).unwrap();
-    let mut cpu_model = callosum_models::models::quantized_qwen2::ModelWeights::from_gguf(
-        content, &mut f, &cpu,
-    )
-    .unwrap();
+    let mut cpu_model =
+        callosum_models::models::quantized_qwen2::ModelWeights::from_gguf(content, &mut f, &cpu)
+            .unwrap();
 
     let gpu_model = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();
     let mut session = gpu_model.new_session(128);
@@ -441,6 +440,280 @@ fn wgpu_qwen2_matches_cpu_reference_tokens() {
     );
 }
 
+/// Qwen3-MoE (router + fused-expert FFN) token parity. The reference
+/// is an inline, cache-free CPU forward built on callosum CPU ops with
+/// everything dequantized to f32 — deliberately independent of both
+/// the wgpu kernels and any model library (callosum-models' MoE path
+/// is CUDA-only). Gated on QWEN3MOE_GGUF.
+#[test]
+fn wgpu_qwen3_moe_matches_cpu_reference_tokens() {
+    let Some(path) = std::env::var_os("QWEN3MOE_GGUF") else {
+        eprintln!("QWEN3MOE_GGUF not set, skipping qwen3moe parity");
+        return;
+    };
+    let Some(dev) = device() else { return };
+    let path = std::path::PathBuf::from(path);
+
+    let gpu_model = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();
+    assert!(gpu_model.cfg.n_experts > 0, "expected an MoE config");
+    let mut session = gpu_model.new_session(64);
+
+    let prompt: Vec<u32> = vec![1, 42, 7, 99, 5];
+    let n_gen = 8;
+
+    // ---- CPU reference ----
+    let cpu = callosum::Device::Cpu;
+    let mut f = std::fs::File::open(&path).unwrap();
+    let content = callosum::quantized::gguf_file::Content::read(&mut f).unwrap();
+    let g = |keys: &str| content.metadata.get(keys).cloned();
+    let mu = |k: &str| g(k).unwrap().to_u32().unwrap() as usize;
+    let hidden = mu("qwen3moe.embedding_length");
+    let n_layers = mu("qwen3moe.block_count");
+    let n_heads = mu("qwen3moe.attention.head_count");
+    let n_kv = mu("qwen3moe.attention.head_count_kv");
+    let head_dim = content
+        .metadata
+        .get("qwen3moe.attention.key_length")
+        .map(|v| v.to_u32().unwrap() as usize)
+        .unwrap_or(hidden / n_heads);
+    let n_exp = mu("qwen3moe.expert_count");
+    let k_used = mu("qwen3moe.expert_used_count");
+    let theta = g("qwen3moe.rope.freq_base")
+        .map(|v| v.to_f32().unwrap())
+        .unwrap_or(10_000.0);
+    let eps = g("qwen3moe.attention.layer_norm_rms_epsilon")
+        .map(|v| v.to_f32().unwrap() as f64)
+        .unwrap_or(1e-6);
+
+    let mut fr = std::fs::File::open(&path).unwrap();
+    let mut dense = |name: &str| -> callosum::Tensor {
+        content
+            .tensor(&mut fr, name, &cpu)
+            .unwrap()
+            .dequantize(&cpu)
+            .unwrap()
+            .to_dtype(callosum::DType::F32)
+            .unwrap()
+    };
+    let embed = dense("token_embd.weight");
+    let out_norm = dense("output_norm.weight");
+    let lm_head = if content.tensor_infos.contains_key("output.weight") {
+        dense("output.weight")
+    } else {
+        embed.clone()
+    };
+
+    struct RefBlock {
+        attn_norm: callosum::Tensor,
+        wq: callosum::Tensor,
+        wk: callosum::Tensor,
+        wv: callosum::Tensor,
+        wo: callosum::Tensor,
+        qn: Option<callosum::Tensor>,
+        kn: Option<callosum::Tensor>,
+        ffn_norm: callosum::Tensor,
+        router: callosum::Tensor,
+        gates: callosum::Tensor,
+        ups: callosum::Tensor,
+        downs: callosum::Tensor,
+    }
+    let blocks: Vec<RefBlock> = (0..n_layers)
+        .map(|b| RefBlock {
+            attn_norm: dense(&format!("blk.{b}.attn_norm.weight")),
+            wq: dense(&format!("blk.{b}.attn_q.weight")),
+            wk: dense(&format!("blk.{b}.attn_k.weight")),
+            wv: dense(&format!("blk.{b}.attn_v.weight")),
+            wo: dense(&format!("blk.{b}.attn_output.weight")),
+            qn: content
+                .tensor_infos
+                .contains_key(&format!("blk.{b}.attn_q_norm.weight"))
+                .then(|| dense(&format!("blk.{b}.attn_q_norm.weight"))),
+            kn: content
+                .tensor_infos
+                .contains_key(&format!("blk.{b}.attn_k_norm.weight"))
+                .then(|| dense(&format!("blk.{b}.attn_k_norm.weight"))),
+            ffn_norm: dense(&format!("blk.{b}.ffn_norm.weight")),
+            router: dense(&format!("blk.{b}.ffn_gate_inp.weight")),
+            gates: dense(&format!("blk.{b}.ffn_gate_exps.weight")),
+            ups: dense(&format!("blk.{b}.ffn_up_exps.weight")),
+            downs: dense(&format!("blk.{b}.ffn_down_exps.weight")),
+        })
+        .collect();
+
+    let rms = |x: &callosum::Tensor, w: &callosum::Tensor| -> callosum::Tensor {
+        let last = x.rank() - 1;
+        let var = x.sqr().unwrap().mean_keepdim(last).unwrap();
+        x.broadcast_div(&(var + eps).unwrap().sqrt().unwrap())
+            .unwrap()
+            .broadcast_mul(w)
+            .unwrap()
+    };
+    // Rotate-half RoPE over [seq, heads, head_dim] rows at positions 0..seq.
+    let rope = |x: &callosum::Tensor, heads: usize| -> callosum::Tensor {
+        let (seq, _, hd) = x.dims3().unwrap();
+        let half = hd / 2;
+        let v: Vec<f32> = x.flatten_all().unwrap().to_vec1().unwrap();
+        let mut out = v.clone();
+        for s in 0..seq {
+            for h in 0..heads {
+                let base = (s * heads + h) * hd;
+                for d in 0..half {
+                    let inv = theta.powf(-2.0 * d as f32 / hd as f32);
+                    let (c, sn) = ((s as f32 * inv).cos(), (s as f32 * inv).sin());
+                    let (x0, x1) = (v[base + d], v[base + d + half]);
+                    out[base + d] = x0 * c - x1 * sn;
+                    out[base + d + half] = x0 * sn + x1 * c;
+                }
+            }
+        }
+        callosum::Tensor::from_vec(out, (seq, heads, hd), &cpu).unwrap()
+    };
+
+    // Cache-free full forward over `tokens`; returns last-position logits.
+    let forward = |tokens: &[u32]| -> Vec<f32> {
+        let seq = tokens.len();
+        let ids = callosum::Tensor::new(tokens, &cpu).unwrap();
+        let mut x = embed.index_select(&ids, 0).unwrap(); // [seq, hidden]
+        for blk in &blocks {
+            let h = rms(&x, &blk.attn_norm);
+            let q = h.matmul(&blk.wq.t().unwrap()).unwrap();
+            let k = h.matmul(&blk.wk.t().unwrap()).unwrap();
+            let v = h.matmul(&blk.wv.t().unwrap()).unwrap();
+            let q = q.reshape((seq, n_heads, head_dim)).unwrap();
+            let k = k.reshape((seq, n_kv, head_dim)).unwrap();
+            let v = v.reshape((seq, n_kv, head_dim)).unwrap();
+            let q = match &blk.qn {
+                Some(w) => rms(&q, w),
+                None => q,
+            };
+            let k = match &blk.kn {
+                Some(w) => rms(&k, w),
+                None => k,
+            };
+            let q = rope(&q, n_heads);
+            let k = rope(&k, n_kv);
+            // Naive causal GQA attention on host vectors.
+            let qv: Vec<f32> = q.flatten_all().unwrap().to_vec1().unwrap();
+            let kv: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
+            let vv: Vec<f32> = v.flatten_all().unwrap().to_vec1().unwrap();
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut att = vec![0f32; seq * n_heads * head_dim];
+            for h in 0..n_heads {
+                let kvh = h / (n_heads / n_kv);
+                for sq in 0..seq {
+                    let mut sc = vec![f32::NEG_INFINITY; seq];
+                    for (sk, e) in sc.iter_mut().enumerate() {
+                        if sk <= sq {
+                            *e = (0..head_dim)
+                                .map(|d| {
+                                    qv[(sq * n_heads + h) * head_dim + d]
+                                        * kv[(sk * n_kv + kvh) * head_dim + d]
+                                })
+                                .sum::<f32>()
+                                * scale;
+                        }
+                    }
+                    let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let ex: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                    let den: f32 = ex.iter().sum();
+                    for d in 0..head_dim {
+                        att[(sq * n_heads + h) * head_dim + d] = (0..seq)
+                            .map(|sk| ex[sk] / den * vv[(sk * n_kv + kvh) * head_dim + d])
+                            .sum();
+                    }
+                }
+            }
+            let att = callosum::Tensor::from_vec(att, (seq, n_heads * head_dim), &cpu).unwrap();
+            let o = att.matmul(&blk.wo.t().unwrap()).unwrap();
+            x = (&x + &o).unwrap();
+
+            // MoE FFN — same routing rule as run_moe.
+            let h2 = rms(&x, &blk.ffn_norm);
+            let logits = h2.matmul(&blk.router.t().unwrap()).unwrap(); // [seq, n_exp]
+            let lv: Vec<f32> = logits.flatten_all().unwrap().to_vec1().unwrap();
+            let h2v: Vec<f32> = h2.flatten_all().unwrap().to_vec1().unwrap();
+            let gv: Vec<f32> = blk.gates.flatten_all().unwrap().to_vec1().unwrap();
+            let uv: Vec<f32> = blk.ups.flatten_all().unwrap().to_vec1().unwrap();
+            let dv: Vec<f32> = blk.downs.flatten_all().unwrap().to_vec1().unwrap();
+            let ffn_dim = blk.gates.dims()[1];
+            let mut moe = vec![0f32; seq * hidden];
+            for t in 0..seq {
+                let row = &lv[t * n_exp..(t + 1) * n_exp];
+                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let den: f32 = row.iter().map(|l| (l - mx).exp()).sum();
+                let probs: Vec<f32> = row.iter().map(|l| (l - mx).exp() / den).collect();
+                let mut idx: Vec<usize> = (0..n_exp).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                let top = &idx[..k_used];
+                let wsum: f32 = top.iter().map(|&i| probs[i]).sum();
+                for &e in top {
+                    let w = probs[e] / wsum;
+                    let xrow = &h2v[t * hidden..(t + 1) * hidden];
+                    let mut gated = vec![0f32; ffn_dim];
+                    for r in 0..ffn_dim {
+                        let gb = (e * ffn_dim + r) * hidden;
+                        let mut gacc = 0f32;
+                        let mut uacc = 0f32;
+                        for i in 0..hidden {
+                            gacc += gv[gb + i] * xrow[i];
+                            uacc += uv[gb + i] * xrow[i];
+                        }
+                        gated[r] = (gacc / (1.0 + (-gacc).exp())) * uacc;
+                    }
+                    for r in 0..hidden {
+                        let db = (e * hidden + r) * ffn_dim;
+                        let mut acc = 0f32;
+                        for i in 0..ffn_dim {
+                            acc += dv[db + i] * gated[i];
+                        }
+                        moe[t * hidden + r] += w * acc;
+                    }
+                }
+            }
+            let moe = callosum::Tensor::from_vec(moe, (seq, hidden), &cpu).unwrap();
+            x = (&x + &moe).unwrap();
+        }
+        let hf = rms(&x, &out_norm);
+        let logits = hf.matmul(&lm_head.t().unwrap()).unwrap();
+        let vocab = logits.dims()[1];
+        logits
+            .narrow(0, seq - 1, 1)
+            .unwrap()
+            .reshape(vocab)
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+
+    let mut cpu_tokens = prompt.clone();
+    for _ in 0..n_gen {
+        let logits = forward(&cpu_tokens);
+        cpu_tokens.push(argmax_of(&logits));
+    }
+
+    let mut gpu_tokens = prompt.clone();
+    for step in 0..n_gen {
+        let input: Vec<u32> = if step == 0 {
+            gpu_tokens.clone()
+        } else {
+            vec![*gpu_tokens.last().unwrap()]
+        };
+        let logits = gpu_model.forward(&mut session, &input).unwrap();
+        gpu_tokens.push(argmax_of(&logits));
+    }
+
+    assert_eq!(
+        &cpu_tokens[prompt.len()..],
+        &gpu_tokens[prompt.len()..],
+        "wgpu qwen3moe greedy tokens diverge from CPU reference"
+    );
+    eprintln!(
+        "wgpu qwen3moe parity OK on {}: {:?}",
+        dev.info().name,
+        &gpu_tokens[prompt.len()..]
+    );
+}
+
 /// Full-model, real-GGUF token parity vs callosum-models' CPU
 /// quantized_llama. Gated on SMOLLM2_GGUF so plain `cargo test` stays
 /// hermetic.
@@ -457,10 +730,9 @@ fn wgpu_llama_matches_cpu_reference_tokens() {
     let cpu = callosum::Device::Cpu;
     let mut f = std::fs::File::open(&path).unwrap();
     let content = callosum::quantized::gguf_file::Content::read(&mut f).unwrap();
-    let mut cpu_model = callosum_models::models::quantized_llama::ModelWeights::from_gguf(
-        content, &mut f, &cpu,
-    )
-    .unwrap();
+    let mut cpu_model =
+        callosum_models::models::quantized_llama::ModelWeights::from_gguf(content, &mut f, &cpu)
+            .unwrap();
 
     // wgpu model.
     let gpu_model = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();

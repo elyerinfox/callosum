@@ -57,8 +57,11 @@ impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let gate = self.feed_forward_gate.forward(xs)?;
         let up = self.feed_forward_up.forward(xs)?;
-        let silu = callosum_nn::ops::silu(&gate)?;
-        let gated = (silu * up)?;
+        // Gemma 3's MLP activation is GELU (the tanh approximation —
+        // HF `gelu_pytorch_tanh`, llama.cpp LLM_FFN_GELU). The silu
+        // this previously used is a different curve and measurably
+        // shifts logits.
+        let gated = (gate.gelu()? * up)?;
         self.feed_forward_down.forward(&gated)
     }
 }
