@@ -110,6 +110,7 @@ struct Pipelines {
     attn_scores_q8: wgpu::ComputePipeline,
     attn_out_q8: wgpu::ComputePipeline,
     kv_scale: wgpu::ComputePipeline,
+    moe_localize: wgpu::ComputePipeline,
     kv_quant: wgpu::ComputePipeline,
     attn_out: wgpu::ComputePipeline,
     copy_to: wgpu::ComputePipeline,
@@ -481,6 +482,7 @@ impl WgpuDevice {
             attn_scores_q8: mk("attn_scores_q8"),
             attn_out_q8: mk("attn_out_q8"),
             kv_scale: mk("kv_scale"),
+            moe_localize: mk("moe_localize"),
             kv_quant: mk("kv_quant"),
             attn_out: mk("attn_out"),
             copy_to: mk("copy_to"),
@@ -947,6 +949,37 @@ impl WgpuDevice {
             &out,
             params,
             (m as u32, 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// Expert-parallel TP: keep only experts [start, end) in a
+    /// routing table ([slots_total, 2] of (expert_id, weight)),
+    /// zeroing foreign slots and rebasing local ids in place.
+    pub fn moe_localize(
+        &self,
+        routing: &GpuBuffer,
+        slots_total: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<GpuBuffer> {
+        if routing.len < slots_total * 2 || start >= end {
+            return Err(WgpuError::Shape("moe_localize: bad args".into()));
+        }
+        let out = self.alloc_out(slots_total * 2);
+        let params = Params {
+            m: slots_total as u32,
+            pos0: start as u32,
+            k: end as u32,
+            ..Default::default()
+        };
+        self.dispatch(
+            &self.inner.pipelines.moe_localize,
+            routing,
+            routing,
+            &out,
+            params,
+            ((slots_total as u32).div_ceil(256), 1, 1),
         );
         Ok(out)
     }

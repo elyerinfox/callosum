@@ -1313,3 +1313,151 @@ fn wgpu_int8_kv_matches_f32_tokens() {
         );
     }
 }
+
+/// Tensor-parallel token parity: two head-sliced ranks on one device,
+/// all-reduce via an in-process rendezvous, vs the unsliced model.
+/// Exact same math modulo f32 summation order, so tokens must match.
+/// Gated on QWEN3_GGUF (16 heads / 8 kv / ffn divisible by 2).
+#[test]
+fn wgpu_tp2_matches_single_rank_tokens() {
+    for (env, label) in [("QWEN3_GGUF", "qwen3"), ("QWEN3MOE_GGUF", "qwen3moe")] {
+        let Some(path) = std::env::var_os(env) else {
+            eprintln!("{env} not set, skipping {label} TP parity");
+            continue;
+        };
+        tp2_case(&std::path::PathBuf::from(path), label);
+    }
+}
+
+/// One dense-or-expert-parallel TP2 case: two head-sliced ranks on one
+/// device vs the unsliced model, all-reduce via in-process rendezvous.
+fn tp2_case(path: &std::path::Path, label: &str) {
+    use std::sync::{Arc, Condvar, Mutex};
+    let Some(dev) = device() else { return };
+    let path = path.to_path_buf();
+
+    #[derive(Default)]
+    struct St {
+        sum: Vec<f32>,
+        n_in: usize,
+        n_out: usize,
+    }
+    struct Rdv {
+        m: Mutex<std::collections::HashMap<(u32, String), St>>,
+        cv: Condvar,
+    }
+    impl Rdv {
+        fn reduce(&self, world: usize, layer: u32, op: &str, data: &mut [f32]) {
+            let key = (layer, op.to_string());
+            let mut g = self.m.lock().unwrap();
+            {
+                let st = g.entry(key.clone()).or_default();
+                if st.sum.is_empty() {
+                    st.sum = vec![0.0; data.len()];
+                }
+                for (s, d) in st.sum.iter_mut().zip(data.iter()) {
+                    *s += *d;
+                }
+                st.n_in += 1;
+            }
+            while g.get(&key).unwrap().n_in < world {
+                g = self.cv.wait(g).unwrap();
+            }
+            {
+                let st = g.get_mut(&key).unwrap();
+                data.copy_from_slice(&st.sum);
+                st.n_out += 1;
+                if st.n_out == world {
+                    g.remove(&key);
+                }
+            }
+            self.cv.notify_all();
+        }
+    }
+    let rdv = Arc::new(Rdv {
+        m: Mutex::new(std::collections::HashMap::new()),
+        cv: Condvar::new(),
+    });
+
+    let prompt: Vec<u32> = vec![1, 42, 7, 99, 5];
+    let n_gen = 8;
+
+    // Reference: unsliced.
+    let full = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();
+    let mut fs = full.new_session(64);
+    let mut want = prompt.clone();
+    for step in 0..n_gen {
+        let input: Vec<u32> = if step == 0 {
+            want.clone()
+        } else {
+            vec![*want.last().unwrap()]
+        };
+        let logits = full.forward(&mut fs, &input).unwrap();
+        want.push(argmax_of(&logits));
+    }
+    drop(fs);
+    drop(full);
+
+    drop(dev);
+
+    // Two ranks, one thread each, each with its OWN device: a
+    // WgpuDevice's dispatch batch and uniform pool are per-forward
+    // state, not safe for two concurrent forwards (the two e2e worker
+    // processes naturally have one device each).
+    let world = 2usize;
+    let mut handles = Vec::new();
+    for rank in 0..world {
+        let path = path.clone();
+        let rdv = rdv.clone();
+        let prompt = prompt.clone();
+        let expect = want.clone();
+        handles.push(std::thread::spawn(move || -> Vec<u32> {
+            let dev = device().unwrap();
+            let hook = callosum_wgpu::llama::TpHook {
+                rank,
+                world,
+                all_reduce: Arc::new(move |layer, op, data: &mut [f32]| {
+                    rdv.reduce(world, layer, op, data);
+                    Ok(())
+                }),
+            };
+            let m = callosum_wgpu::llama::WgpuLlama::from_gguf_stage_with(
+                &path,
+                &dev,
+                0,
+                usize::MAX,
+                true,
+                true,
+                callosum_wgpu::llama::LoadOpts {
+                    cpu_moe: false,
+                    tp: Some(hook),
+                },
+            )
+            .unwrap();
+            let mut session = m.new_session(64);
+            let mut toks = prompt.clone();
+            for step in 0..expect.len() - prompt.len() {
+                let input: Vec<u32> = if step == 0 {
+                    toks.clone()
+                } else {
+                    vec![*toks.last().unwrap()]
+                };
+                let logits = m.forward(&mut session, &input).unwrap();
+                toks.push(argmax_of(&logits));
+            }
+            toks
+        }));
+    }
+    let results: Vec<Vec<u32>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for (rank, got) in results.iter().enumerate() {
+        assert_eq!(
+            &want[prompt.len()..],
+            &got[prompt.len()..],
+            "{label} rank {rank}: TP tokens diverge from single-rank reference"
+        );
+    }
+    eprintln!(
+        "wgpu {label} TP2 parity OK: {:?}",
+        &results[0][prompt.len()..]
+    );
+}

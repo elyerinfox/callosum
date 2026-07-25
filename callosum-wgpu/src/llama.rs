@@ -192,6 +192,35 @@ fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
     }
 }
 
+/// Tensor-parallel hook: the engine computes per-rank partials and
+/// calls `all_reduce` (in-place sum across ranks) at the two reduce
+/// points per block (attn output, FFN down). The comm mechanism —
+/// coordinator relay, NCCL-alike, anything — is the caller's; the
+/// engine only needs rank/world for slicing and this callback.
+#[derive(Clone)]
+pub struct TpHook {
+    pub rank: usize,
+    pub world: usize,
+    /// (layer_idx, op_kind, data) -> summed data in place. op_kind
+    /// folds in the token position so back-to-back steps on one layer
+    /// pair up at distinct barriers.
+    #[allow(clippy::type_complexity)]
+    pub all_reduce: std::sync::Arc<
+        dyn Fn(u32, &str, &mut [f32]) -> std::result::Result<(), String> + Send + Sync,
+    >,
+}
+
+/// Engine load options beyond the layer-range/globals basics.
+#[derive(Default, Clone)]
+pub struct LoadOpts {
+    /// Routed MoE experts stay quantized in host RAM; expert FFN math
+    /// runs on the CPU (activations-only bus traffic).
+    pub cpu_moe: bool,
+    /// Tensor parallelism: this rank holds a contiguous head subset of
+    /// every attention and a row/col slice of every dense FFN.
+    pub tp: Option<TpHook>,
+}
+
 /// Where routed expert weights live. Resident: fused and quantized on
 /// the GPU exactly as stored on disk, dequantized in-shader by the
 /// expert-indexed matmul kernels. Host (`cpu_moe` expert offload):
@@ -236,12 +265,23 @@ pub(crate) fn split_expert_qmatmuls_host(
     fused: &callosum::quantized::QTensor,
     n_experts: usize,
 ) -> Result<Vec<callosum::quantized::QMatMul>> {
+    split_expert_qmatmuls_host_range(fused, n_experts, 0, n_experts)
+}
+
+/// [`split_expert_qmatmuls_host`] for the expert subrange
+/// [start, end) — expert-parallel TP ranks each hold their own slice.
+pub(crate) fn split_expert_qmatmuls_host_range(
+    fused: &callosum::quantized::QTensor,
+    n_experts: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<callosum::quantized::QMatMul>> {
     use callosum::quantized::{QMatMul, QStorage, QTensor};
     let cpu = callosum::Device::Cpu;
     let dims = fused.shape().dims().to_vec();
-    if dims.len() != 3 || dims[0] != n_experts {
+    if dims.len() != 3 || dims[0] != n_experts || start >= end || end > n_experts {
         return Err(WgpuError::Shape(format!(
-            "fused expert tensor must be [{n_experts}, rows, cols], got {dims:?}"
+            "fused expert tensor must be [{n_experts}, rows, cols] with a valid range, got {dims:?} [{start},{end})"
         )));
     }
     let (rows, cols) = (dims[1], dims[2]);
@@ -263,8 +303,8 @@ pub(crate) fn split_expert_qmatmuls_host(
             n_experts * per_expert_bytes
         )));
     }
-    let mut out = Vec::with_capacity(n_experts);
-    for e in 0..n_experts {
+    let mut out = Vec::with_capacity(end - start);
+    for e in start..end {
         let slice = &data[e * per_expert_bytes..(e + 1) * per_expert_bytes];
         let storage = QStorage::from_data(std::borrow::Cow::Borrowed(slice), &cpu, dtype)
             .map_err(|e| WgpuError::Device(format!("expert {e} storage: {e}")))?;
@@ -299,6 +339,11 @@ pub(crate) fn host_moe_forward(
         for s in 0..slots {
             let e = table[(t * slots + s) * 2] as usize;
             let w = table[(t * slots + s) * 2 + 1];
+            // Zero-weight slots are experts owned by other TP ranks
+            // (moe_localize) -- skip the wasted matmuls.
+            if w == 0.0 {
+                continue;
+            }
             let entry = by_expert.entry(e).or_default();
             entry.0.push(t as u32);
             entry.1.push(w);
@@ -348,6 +393,9 @@ enum Ffn {
         /// Routed expert weights — VRAM-resident or host-offloaded.
         experts: ExpertStore,
         ffn_dim: usize,
+        /// Expert-parallel TP: the global expert range this rank owns
+        /// (`None` = all experts local, no reduce needed).
+        expert_range: Option<(usize, usize)>,
         /// Fused shared experts (glm4moe/deepseek `shexp`), run dense
         /// on the same input and added to the routed mixture.
         shared: Option<Box<(Weight, Weight, Weight)>>,
@@ -386,6 +434,8 @@ pub struct WgpuLlama {
     /// output globals.
     out_norm: Option<GpuBuffer>,
     lm_head: Option<Weight>,
+    /// Tensor-parallel hook; None when this shard owns all heads.
+    tp: Option<TpHook>,
     /// Total bytes uploaded for weights (quantized at on-disk density,
     /// f32 where a format fell back). What a serving layer should
     /// report as resident.
@@ -590,6 +640,33 @@ impl WgpuLlama {
         owns_output: bool,
         cpu_moe: bool,
     ) -> Result<Self> {
+        Self::from_gguf_stage_with(
+            path,
+            dev,
+            layer_start,
+            layer_end,
+            owns_input,
+            owns_output,
+            LoadOpts {
+                cpu_moe,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`Self::from_gguf_stage`] with full [`LoadOpts`] (cpu_moe
+    /// expert offload, tensor parallelism).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gguf_stage_with(
+        path: &std::path::Path,
+        dev: &WgpuDevice,
+        layer_start: usize,
+        layer_end: usize,
+        owns_input: bool,
+        owns_output: bool,
+        opts: LoadOpts,
+    ) -> Result<Self> {
+        let cpu_moe = opts.cpu_moe;
         let mut file =
             std::fs::File::open(path).map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
         let content = gguf_file::Content::read(&mut file)
@@ -668,6 +745,48 @@ impl WgpuLlama {
             )));
         }
 
+        // Tensor parallelism: this rank keeps heads
+        // [rank*local, (rank+1)*local) of every attention and the
+        // matching row/col slice of every dense FFN. Same divisibility
+        // contract as the CUDA backend.
+        let tp_world = opts.tp.as_ref().map(|t| t.world).unwrap_or(1);
+        let tp_rank = opts.tp.as_ref().map(|t| t.rank).unwrap_or(0);
+        if tp_world > 1 {
+            // qwen-family MoEs run expert-parallel (each rank owns a
+            // contiguous expert range; partials summed by the
+            // all-reduce). glm4moe's shared experts + sigmoid routing
+            // are refused, matching the CUDA backend.
+            if is_moe && !matches!(arch.as_str(), "qwen3moe" | "qwen35moe") {
+                return Err(WgpuError::Device(format!(
+                    "wgpu TP supports dense archs and qwen-family MoEs (got {arch:?})"
+                )));
+            }
+            if is_moe && !n_experts.is_multiple_of(tp_world) {
+                return Err(WgpuError::Shape(format!(
+                    "n_experts {n_experts} not divisible by tp world {tp_world}"
+                )));
+            }
+            if !n_heads.is_multiple_of(tp_world) {
+                return Err(WgpuError::Shape(format!(
+                    "n_heads {n_heads} not divisible by tp world {tp_world}"
+                )));
+            }
+            if !n_kv_heads.is_multiple_of(tp_world) {
+                return Err(WgpuError::Shape(format!(
+                    "n_kv_heads {n_kv_heads} not divisible by tp world {tp_world}"
+                )));
+            }
+        }
+        let n_heads_local = n_heads / tp_world.max(1);
+        let n_kv_local = n_kv_heads / tp_world.max(1);
+        // Expert-parallel range for MoE blocks (full range without TP).
+        let e_local = if is_moe {
+            n_experts / tp_world.max(1)
+        } else {
+            0
+        };
+        let (e_start, e_end) = (tp_rank * e_local, (tp_rank + 1) * e_local);
+
         // Cheap CPU device for dequantizing non-quant-kernel tensors.
         let cpu = callosum::Device::Cpu;
         let weight_bytes = std::cell::Cell::new(0u64);
@@ -738,6 +857,74 @@ impl WgpuLlama {
             }
         };
 
+        // TP loader: slice a rank-2 weight along rows (dim 0) or
+        // columns (dim 1) BEFORE upload, keeping the on-disk quant
+        // density whenever the slice is block-aligned (rows always
+        // are; columns when the span is a whole number of blocks).
+        // Falls back to a dequantized f32 slice otherwise.
+        let mut file4 =
+            std::fs::File::open(path).map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
+        let mut load_weight_slice =
+            |name: &str, dim: usize, start: usize, count: usize| -> Result<Weight> {
+                let qt = content
+                    .tensor(&mut file4, name, &cpu)
+                    .map_err(|e| WgpuError::Device(format!("load {name}: {e}")))?;
+                let dims = qt.shape().dims().to_vec();
+                if dims.len() != 2 {
+                    return Err(WgpuError::Shape(format!("{name}: expected rank-2")));
+                }
+                let (n, k) = (dims[0], dims[1]);
+                if (dim == 0 && start + count > n) || (dim == 1 && start + count > k) {
+                    return Err(WgpuError::Shape(format!("{name}: TP slice out of bounds")));
+                }
+                let fmt = quant_dtype(qt.dtype());
+                let aligned = match (dim, fmt) {
+                    (0, Some(f)) => k.is_multiple_of(f.block_elems()),
+                    (1, Some(f)) => {
+                        start.is_multiple_of(f.block_elems())
+                            && count.is_multiple_of(f.block_elems())
+                    }
+                    _ => false,
+                };
+                if let (Some(f), true) = (fmt, aligned) {
+                    let raw = qt
+                        .data()
+                        .map_err(|e| WgpuError::Device(format!("{name} bytes: {e}")))?;
+                    let row_bytes = k / f.block_elems() * f.block_bytes();
+                    let sliced: Vec<u8> = if dim == 0 {
+                        raw[start * row_bytes..(start + count) * row_bytes].to_vec()
+                    } else {
+                        let off = start / f.block_elems() * f.block_bytes();
+                        let span = count / f.block_elems() * f.block_bytes();
+                        let mut out = Vec::with_capacity(n * span);
+                        for r in 0..n {
+                            out.extend_from_slice(
+                                &raw[r * row_bytes + off..r * row_bytes + off + span],
+                            );
+                        }
+                        out
+                    };
+                    weight_bytes.set(weight_bytes.get() + sliced.len() as u64);
+                    let (sn, sk) = if dim == 0 { (count, k) } else { (n, count) };
+                    return dev.upload_quantized(&sliced, sn, sk, f).map(Weight::Quant);
+                }
+                let t = qt
+                    .dequantize(&cpu)
+                    .and_then(|t| t.to_dtype(callosum::DType::F32))
+                    .and_then(|t| t.narrow(dim, start, count))
+                    .and_then(|t| t.contiguous())
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(|e| WgpuError::Device(format!("dequantize {name}: {e}")))?;
+                weight_bytes.set(weight_bytes.get() + (t.len() * 4) as u64);
+                let (sn, sk) = if dim == 0 { (count, k) } else { (n, count) };
+                Ok(Weight::F32 {
+                    buf: dev.upload(&t),
+                    n: sn,
+                    k: sk,
+                })
+            };
+
         let has = |name: &str| content.tensor_infos.contains_key(name);
         // Fused MoE expert tensors are rank-3 [n_experts, rows, cols];
         // flatten to [n_experts * rows, cols] so one QuantBuffer holds
@@ -756,6 +943,48 @@ impl WgpuLlama {
                 )));
             }
             let (n_e, rows, cols) = (dims[0], dims[1], dims[2]);
+            // Expert-parallel TP: keep only this rank's expert range.
+            // Experts are contiguous in the fused payload, so the
+            // slice stays at on-disk quant density.
+            let (e_lo, e_hi) = if tp_world > 1 {
+                (e_start.min(n_e), e_end.min(n_e))
+            } else {
+                (0, n_e)
+            };
+            if (e_lo, e_hi) != (0, n_e) {
+                let dtype = qt.dtype();
+                let per_expert_elems = rows * cols;
+                if per_expert_elems.is_multiple_of(dtype.block_size()) {
+                    if let Some(fmt) = quant_dtype(dtype) {
+                        if cols.is_multiple_of(fmt.block_elems()) {
+                            let per_expert_bytes =
+                                per_expert_elems / dtype.block_size() * dtype.type_size();
+                            let raw = qt
+                                .data()
+                                .map_err(|e| WgpuError::Device(format!("{name} bytes: {e}")))?;
+                            let sliced = &raw[e_lo * per_expert_bytes..e_hi * per_expert_bytes];
+                            weight_bytes.set(weight_bytes.get() + sliced.len() as u64);
+                            return dev
+                                .upload_quantized(sliced, (e_hi - e_lo) * rows, cols, fmt)
+                                .map(Weight::Quant);
+                        }
+                    }
+                }
+                let t = qt
+                    .dequantize(&cpu)
+                    .and_then(|t| t.to_dtype(callosum::DType::F32))
+                    .and_then(|t| t.narrow(0, e_lo, e_hi - e_lo))
+                    .and_then(|t| t.contiguous())
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(|e| WgpuError::Device(format!("dequantize {name}: {e}")))?;
+                weight_bytes.set(weight_bytes.get() + (t.len() * 4) as u64);
+                return Ok(Weight::F32 {
+                    buf: dev.upload(&t),
+                    n: (e_hi - e_lo) * rows,
+                    k: cols,
+                });
+            }
             match quant_dtype(qt.dtype()) {
                 Some(fmt) if cols % fmt.block_elems() == 0 => {
                     let raw = qt
@@ -791,9 +1020,34 @@ impl WgpuLlama {
                     Ok(None)
                 }
             };
-            let bq = opt_f32(format!("blk.{b}.attn_q.bias"))?;
-            let bk = opt_f32(format!("blk.{b}.attn_k.bias"))?;
-            let bv = opt_f32(format!("blk.{b}.attn_v.bias"))?;
+            // Under TP, biases follow the head slice of their matrix.
+            // Self-contained (own file handle) so it doesn't contend
+            // with the other loader closures for `load_f32`.
+            let opt_bias = |name: String, span: usize| -> Result<Option<GpuBuffer>> {
+                if !has(&name) {
+                    return Ok(None);
+                }
+                let mut file_b = std::fs::File::open(path)
+                    .map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
+                let t = content
+                    .tensor(&mut file_b, &name, &cpu)
+                    .map_err(|e| WgpuError::Device(format!("load {name}: {e}")))?
+                    .dequantize(&cpu)
+                    .and_then(|t| t.to_dtype(callosum::DType::F32))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(|e| WgpuError::Device(format!("dequantize {name}: {e}")))?;
+                let (lo, hi) = if tp_world > 1 {
+                    (tp_rank * span, (tp_rank + 1) * span)
+                } else {
+                    (0, t.len())
+                };
+                weight_bytes.set(weight_bytes.get() + ((hi - lo) * 4) as u64);
+                Ok(Some(dev.upload(&t[lo..hi])))
+            };
+            let bq = opt_bias(format!("blk.{b}.attn_q.bias"), n_heads_local * head_dim)?;
+            let bk = opt_bias(format!("blk.{b}.attn_k.bias"), n_kv_local * head_dim)?;
+            let bv = opt_bias(format!("blk.{b}.attn_v.bias"), n_kv_local * head_dim)?;
             let q_norm = opt_f32(format!("blk.{b}.attn_q_norm.weight"))?;
             let k_norm = opt_f32(format!("blk.{b}.attn_k_norm.weight"))?;
             let mut post_attn_norm = opt_f32(format!("blk.{b}.post_attention_norm.weight"))?;
@@ -830,7 +1084,15 @@ impl WgpuLlama {
                                 .map_err(|e| WgpuError::Device(format!("{name} bytes: {e}")))?
                                 .len() as u64;
                             host_expert_bytes.set(host_expert_bytes.get() + bytes);
-                            Ok((split_expert_qmatmuls_host(&qt, n_experts)?, dims[1]))
+                            let (s, e) = if tp_world > 1 {
+                                (e_start, e_end)
+                            } else {
+                                (0, n_experts)
+                            };
+                            Ok((
+                                split_expert_qmatmuls_host_range(&qt, n_experts, s, e)?,
+                                dims[1],
+                            ))
                         };
                     let (gates, ffn_dim) = load_host(format!("blk.{b}.ffn_gate_exps.weight"))?;
                     let (ups, _) = load_host(format!("blk.{b}.ffn_up_exps.weight"))?;
@@ -840,11 +1102,17 @@ impl WgpuLlama {
                         ffn_dim,
                     )
                 } else {
+                    let n_local = if tp_world > 1 {
+                        e_end - e_start
+                    } else {
+                        n_experts
+                    };
                     let gates = load_expert_weight(&format!("blk.{b}.ffn_gate_exps.weight"))?;
                     let ffn_dim = match &gates {
-                        // Fused rows = n_experts * ffn_dim.
-                        Weight::F32 { n, .. } => *n / n_experts,
-                        Weight::Quant(q) => q.n / n_experts,
+                        // Fused rows = n_local * ffn_dim (expert-range
+                        // sliced under TP).
+                        Weight::F32 { n, .. } => *n / n_local,
+                        Weight::Quant(q) => q.n / n_local,
                     };
                     (
                         ExpertStore::Resident(Box::new(ResidentExperts {
@@ -869,7 +1137,50 @@ impl WgpuLlama {
                     router_bias,
                     experts,
                     ffn_dim,
+                    expert_range: (tp_world > 1).then_some((e_start, e_end)),
                     shared,
+                }
+            } else if tp_world > 1 {
+                // Row-parallel gate/up, column-parallel down; the down
+                // matmul yields a per-rank partial over the full
+                // hidden dim, summed by the all-reduce hook. Fused
+                // gate+up (GLM-4) can't row-split cleanly — refused,
+                // matching the CUDA backend.
+                if !has(&format!("blk.{b}.ffn_gate.weight")) {
+                    return Err(WgpuError::Device(
+                        "TP with fused gate+up FFN (glm4) is not supported".into(),
+                    ));
+                }
+                let ffn_dim = content
+                    .tensor_infos
+                    .get(&format!("blk.{b}.ffn_gate.weight"))
+                    .map(|i| i.shape.dims()[0])
+                    .unwrap_or(0);
+                if !ffn_dim.is_multiple_of(tp_world) {
+                    return Err(WgpuError::Shape(format!(
+                        "ffn_dim {ffn_dim} not divisible by tp world {tp_world}"
+                    )));
+                }
+                let local = ffn_dim / tp_world;
+                Ffn::Dense {
+                    gate: Some(load_weight_slice(
+                        &format!("blk.{b}.ffn_gate.weight"),
+                        0,
+                        tp_rank * local,
+                        local,
+                    )?),
+                    up: load_weight_slice(
+                        &format!("blk.{b}.ffn_up.weight"),
+                        0,
+                        tp_rank * local,
+                        local,
+                    )?,
+                    down: load_weight_slice(
+                        &format!("blk.{b}.ffn_down.weight"),
+                        1,
+                        tp_rank * local,
+                        local,
+                    )?,
                 }
             } else {
                 Ffn::Dense {
@@ -884,12 +1195,29 @@ impl WgpuLlama {
             };
             // Recycle upload staging so weights aren't resident twice.
             dev.reclaim_staging();
+            let (wq, wk, wv, wo) = if tp_world > 1 {
+                let qr = n_heads_local * head_dim;
+                let kr = n_kv_local * head_dim;
+                (
+                    load_weight_slice(&format!("blk.{b}.attn_q.weight"), 0, tp_rank * qr, qr)?,
+                    load_weight_slice(&format!("blk.{b}.attn_k.weight"), 0, tp_rank * kr, kr)?,
+                    load_weight_slice(&format!("blk.{b}.attn_v.weight"), 0, tp_rank * kr, kr)?,
+                    load_weight_slice(&format!("blk.{b}.attn_output.weight"), 1, tp_rank * qr, qr)?,
+                )
+            } else {
+                (
+                    load_weight(&format!("blk.{b}.attn_q.weight"))?,
+                    load_weight(&format!("blk.{b}.attn_k.weight"))?,
+                    load_weight(&format!("blk.{b}.attn_v.weight"))?,
+                    load_weight(&format!("blk.{b}.attn_output.weight"))?,
+                )
+            };
             blocks.push(Block {
                 attn_norm,
-                wq: load_weight(&format!("blk.{b}.attn_q.weight"))?,
-                wk: load_weight(&format!("blk.{b}.attn_k.weight"))?,
-                wv: load_weight(&format!("blk.{b}.attn_v.weight"))?,
-                wo: load_weight(&format!("blk.{b}.attn_output.weight"))?,
+                wq,
+                wk,
+                wv,
+                wo,
                 bq,
                 bk,
                 bv,
@@ -928,8 +1256,10 @@ impl WgpuLlama {
                 n_layers,
                 layer_start,
                 layer_end,
-                n_heads,
-                n_kv_heads,
+                // LOCAL head counts under TP — the kernels, sessions,
+                // and rope all operate on this rank's slice.
+                n_heads: n_heads_local,
+                n_kv_heads: n_kv_local,
                 head_dim,
                 vocab,
                 rope_theta,
@@ -946,6 +1276,7 @@ impl WgpuLlama {
             blocks,
             out_norm,
             lm_head,
+            tp: opts.tp,
             weight_bytes: weight_bytes.get(),
             host_expert_bytes: host_expert_bytes.get(),
         })
@@ -992,6 +1323,15 @@ impl WgpuLlama {
     /// The wgpu device this model lives on.
     pub fn device(&self) -> &WgpuDevice {
         &self.dev
+    }
+
+    /// All-reduce a per-rank partial across the TP group (identity
+    /// without TP): download, sum via the hook, re-upload.
+    fn tp_reduce(&self, buf: GpuBuffer, layer: u32, op_kind: &str) -> Result<GpuBuffer> {
+        let Some(tp) = &self.tp else { return Ok(buf) };
+        let mut host = self.dev.download(&buf)?;
+        (tp.all_reduce)(layer, op_kind, &mut host).map_err(WgpuError::Device)?;
+        Ok(self.dev.upload(&host))
     }
 
     /// Run `tokens` at the session's current position and return the
@@ -1140,6 +1480,11 @@ impl WgpuLlama {
                 cfg.head_dim,
             )?;
             let o = blk.wo.matmul_t(&self.dev, &att, seq)?;
+            let o = self.tp_reduce(
+                o,
+                (cfg.layer_start + li) as u32,
+                &format!("attn_out:{pos0}"),
+            )?;
             let o = match &blk.post_attn_norm {
                 Some(w) => self.dev.rms_norm(&o, w, seq, cfg.hidden, cfg.rms_eps)?,
                 None => o,
@@ -1169,13 +1514,19 @@ impl WgpuLlama {
                             self.dev.silu_mul(&g, &u)?
                         }
                     };
-                    down.matmul_t(&self.dev, &gu, seq)?
+                    let d = down.matmul_t(&self.dev, &gu, seq)?;
+                    self.tp_reduce(
+                        d,
+                        (cfg.layer_start + li) as u32,
+                        &format!("ffn_down:{pos0}"),
+                    )?
                 }
                 Ffn::Moe {
                     router,
                     router_bias,
                     experts,
                     ffn_dim,
+                    expert_range,
                     shared,
                 } => {
                     // Same routing rule as the CUDA backend's
@@ -1198,6 +1549,13 @@ impl WgpuLlama {
                         cfg.moe_weights_scale,
                     )?;
                     let slots = cfg.n_experts_used;
+                    // Expert-parallel TP: zero foreign slots and rebase
+                    // local ids before the expert-indexed matmuls; the
+                    // cross-rank all-reduce below restores the full sum.
+                    let routing = match expert_range {
+                        Some((es, ee)) => self.dev.moe_localize(&routing, seq * slots, *es, *ee)?,
+                        None => routing,
+                    };
                     let routed = match experts {
                         ExpertStore::Resident(rx) => {
                             let ResidentExperts { gates, ups, downs } = rx.as_ref();
@@ -1228,6 +1586,15 @@ impl WgpuLlama {
                                 .map_err(|e| WgpuError::Device(format!("cpu_moe forward: {e}")))?;
                             self.dev.upload(&out)
                         }
+                    };
+                    let routed = if expert_range.is_some() {
+                        self.tp_reduce(
+                            routed,
+                            (cfg.layer_start + li) as u32,
+                            &format!("moe_out:{pos0}"),
+                        )?
+                    } else {
+                        routed
                     };
                     match shared.as_deref() {
                         Some((sg, su, sd)) => {

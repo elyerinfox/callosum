@@ -284,6 +284,26 @@ fn moe_topk(@builtin(workgroup_id) wid: vec3<u32>) {
     }
 }
 
+// Expert-parallel TP: rewrite a routing table in place so only this
+// rank's experts [pos0, k) survive — foreign slots get weight 0 (their
+// contribution arrives via the cross-rank all-reduce), local ids are
+// rebased to the rank's fused buffer. One thread per slot.
+@compute @workgroup_size(256, 1, 1)
+fn moe_localize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.m) {
+        return;
+    }
+    let id = u32(a[i * 2u]);
+    if (id < params.pos0 || id >= params.k) {
+        out[i * 2u] = 0.0;
+        out[i * 2u + 1u] = 0.0;
+    } else {
+        out[i * 2u] = f32(id - params.pos0);
+        out[i * 2u + 1u] = a[i * 2u + 1u];
+    }
+}
+
 // MoE combine: a = expert outputs [m tokens * n_heads slots, k hidden];
 // c = routing table [m, n_heads, 2]; out[t, h] = sum_s w(t,s)*a[t,s,h].
 @compute @workgroup_size(256, 1, 1)
