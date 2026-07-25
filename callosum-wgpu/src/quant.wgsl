@@ -325,6 +325,153 @@ fn dot_q4_k(row_word: u32, unit: u32, x_base: u32) -> f32 {
     return d * sm.x * qdot - dmin * sm.y * xsum;
 }
 
+// Cooperative q4_K matvec warp body: 32 lanes share one row and read
+// CONSECUTIVE qs words per super-block (full coalescing), vs the
+// generic path's lane-strided unit walk. Lane l owns qs bytes
+// [4l, 4l+4): nibble pair p = l/8, in-pair offset q0 = 4*(l%8).
+fn q4k_row_coop(row_word: u32, sbs: u32, lane: u32, x_base: u32) -> f32 {
+    var acc: f32 = 0.0;
+    let p = lane / 8u;
+    let q0 = 4u * (lane % 8u);
+    for (var sb: u32 = 0u; sb < sbs; sb = sb + 1u) {
+        let base = sb * 144u;
+        let d = f16at(row_word, base);
+        let dmin = f16at(row_word, base + 2u);
+        let sm0 = scale_min_k4(row_word, base + 4u, 2u * p);
+        let sm1 = scale_min_k4(row_word, base + 4u, 2u * p + 1u);
+        // Coalesced: lanes 0..32 load the super-block's 32 qs words.
+        let w = bitcast<u32>(b[row_word + (base + 16u) / 4u + lane]);
+        var qdot0: f32 = 0.0;
+        var xsum0: f32 = 0.0;
+        var qdot1: f32 = 0.0;
+        var xsum1: f32 = 0.0;
+        let xb = x_base + sb * 256u + 64u * p + q0;
+        for (var jj: u32 = 0u; jj < 4u; jj = jj + 1u) {
+            let byte = (w >> (8u * jj)) & 0xFFu;
+            let x0 = a[xb + jj];
+            let x1 = a[xb + 32u + jj];
+            qdot0 = qdot0 + f32(byte & 0xFu) * x0;
+            xsum0 = xsum0 + x0;
+            qdot1 = qdot1 + f32(byte >> 4u) * x1;
+            xsum1 = xsum1 + x1;
+        }
+        acc = acc + d * (sm0.x * qdot0 + sm1.x * qdot1) - dmin * (sm0.y * xsum0 + sm1.y * xsum1);
+    }
+    return acc;
+}
+
+// Cooperative q6_K warp body: 32 lanes = 2 halves x 16 position-pairs.
+// Each lane owns positions {2i, 2i+1} of its half and produces the 4
+// quarter elements per position (ql low/high nibble + qh bit pairs),
+// reading bytes that adjacent lanes access contiguously.
+fn q6k_row_coop(row_word: u32, sbs: u32, lane: u32, x_base: u32) -> f32 {
+    var acc: f32 = 0.0;
+    let half = lane / 16u;
+    let p0 = 2u * (lane % 16u);
+    for (var sb: u32 = 0u; sb < sbs; sb = sb + 1u) {
+        let base = sb * 210u;
+        let d = f16at(row_word, base + 208u);
+        let ql = base + 64u * half;
+        let qh = base + 128u + 32u * half;
+        let sc = base + 192u + 8u * half;
+        let xb = x_base + sb * 256u + 128u * half;
+        for (var pi: u32 = 0u; pi < 2u; pi = pi + 1u) {
+            let l = p0 + pi;
+            let lo0 = bget(row_word, ql + l);
+            let lo32 = bget(row_word, ql + 32u + l);
+            let hi = bget(row_word, qh + l);
+            let r = l / 16u; // scale column within quarter pair
+            let s0 = i8at(row_word, sc + r);
+            let s1 = i8at(row_word, sc + 2u + r);
+            let s2 = i8at(row_word, sc + 4u + r);
+            let s3 = i8at(row_word, sc + 6u + r);
+            let q1 = f32((lo0 & 0xFu) | (((hi >> 0u) & 3u) << 4u)) - 32.0;
+            let q2 = f32((lo32 & 0xFu) | (((hi >> 2u) & 3u) << 4u)) - 32.0;
+            let q3 = f32((lo0 >> 4u) | (((hi >> 4u) & 3u) << 4u)) - 32.0;
+            let q4 = f32((lo32 >> 4u) | (((hi >> 6u) & 3u) << 4u)) - 32.0;
+            acc = acc
+                + d * s0 * q1 * a[xb + l]
+                + d * s1 * q2 * a[xb + 32u + l]
+                + d * s2 * q3 * a[xb + 64u + l]
+                + d * s3 * q4 * a[xb + 96u + l];
+        }
+    }
+    return acc;
+}
+
+// Cooperative q2_K warp body: lanes 0..16 take even super-block qs
+// words, 16..32 the odd super-block (2 super-blocks per iteration);
+// each qs byte yields one element per 2-bit shift (4 quarters).
+fn q2k_row_coop(row_word: u32, sbs: u32, lane: u32, x_base: u32) -> f32 {
+    var acc: f32 = 0.0;
+    let sb_off = lane / 16u;
+    let wq = lane % 16u; // qs word index within the super-block (of 16)
+    let half = wq / 8u;
+    let idx = (wq % 8u) * 4u; // first qs byte within the half (0..32)
+    let sub16 = idx / 16u;
+    for (var sb2: u32 = 0u; sb2 < sbs; sb2 = sb2 + 2u) {
+        let sb = sb2 + sb_off;
+        if (sb >= sbs) {
+            continue;
+        }
+        let base = sb * 84u;
+        let d = f16at(row_word, base + 80u);
+        let dmin = f16at(row_word, base + 82u);
+        let w = bitcast<u32>(b[row_word + (base + 16u) / 4u + wq]);
+        let scb = base + half * 8u;
+        let xq = x_base + sb * 256u + half * 128u + sub16 * 16u + (idx % 16u);
+        for (var j2: u32 = 0u; j2 < 4u; j2 = j2 + 1u) {
+            let sc = bget(row_word, scb + j2 * 2u + sub16);
+            let dl = d * f32(sc & 0xFu);
+            let ml = dmin * f32(sc >> 4u);
+            let xb2 = xq + j2 * 32u;
+            for (var jj: u32 = 0u; jj < 4u; jj = jj + 1u) {
+                let q = ((w >> (8u * jj)) >> (2u * j2)) & 3u;
+                let x = a[xb2 + jj];
+                acc = acc + dl * f32(q) * x - ml * x;
+            }
+        }
+    }
+    return acc;
+}
+
+// Cooperative q3_K warp body: same shape as q2_K plus the hmask high
+// bit (offset -4 when clear) and the 6-bit kmask scales.
+fn q3k_row_coop(row_word: u32, sbs: u32, lane: u32, x_base: u32) -> f32 {
+    var acc: f32 = 0.0;
+    let sb_off = lane / 16u;
+    let wq = lane % 16u;
+    let half = wq / 8u;
+    let idx = (wq % 8u) * 4u;
+    let sub16 = idx / 16u;
+    for (var sb2: u32 = 0u; sb2 < sbs; sb2 = sb2 + 2u) {
+        let sb = sb2 + sb_off;
+        if (sb >= sbs) {
+            continue;
+        }
+        let base = sb * 110u;
+        let d = f16at(row_word, base + 108u);
+        let w = u32at(row_word, base + 32u + half * 32u + idx);
+        let hm = u32at(row_word, base + sub16 * 16u + (idx % 16u));
+        let xq = x_base + sb * 256u + half * 128u + sub16 * 16u + (idx % 16u);
+        for (var j2: u32 = 0u; j2 < 4u; j2 = j2 + 1u) {
+            let is = half * 8u + j2 * 2u + sub16;
+            let s = q3k_scale(row_word, base, is);
+            let dl = d * s;
+            let hbit = half * 4u + j2;
+            let xb2 = xq + j2 * 32u;
+            for (var jj: u32 = 0u; jj < 4u; jj = jj + 1u) {
+                var q = f32(((w >> (8u * jj)) >> (2u * j2)) & 3u);
+                if ((((hm >> (8u * jj)) >> hbit) & 1u) == 0u) {
+                    q = q - 4.0;
+                }
+                acc = acc + dl * q * a[xb2 + jj];
+            }
+        }
+    }
+    return acc;
+}
+
 // ---- q5_K: d, dmin, scales[12], qh[32], qs[128] (176 B) ----
 
 fn dot_q5_k(row_word: u32, unit: u32, x_base: u32) -> f32 {

@@ -1580,8 +1580,7 @@ impl WgpuLlama {
                             // CPU over byte-sliced quantized weights,
                             // and only the [seq, hidden] result comes
                             // back — weights never cross the bus.
-                            let table = self.dev.download(&routing)?;
-                            let h2v = self.dev.download(&h2)?;
+                            let (table, h2v) = self.dev.download2(&routing, &h2)?;
                             let out = host_moe_forward(hx, &table, &h2v, seq, cfg.hidden, slots)
                                 .map_err(|e| WgpuError::Device(format!("cpu_moe forward: {e}")))?;
                             self.dev.upload(&out)

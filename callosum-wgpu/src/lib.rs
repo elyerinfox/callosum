@@ -386,6 +386,9 @@ impl WgpuDevice {
         for fmt in QuantDtype::ALL {
             src.push_str(&quant_entry_points(fmt.fn_suffix()));
         }
+        for f in ["q4k", "q6k", "q2k", "q3k"] {
+            src.push_str(&coop_entry_points(f));
+        }
         src.push_str(MATVEC_F32);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("callosum-wgpu kernels"),
@@ -453,6 +456,18 @@ impl WgpuDevice {
             quant.insert((fmt, false), mk(&format!("matmul_t_{}", fmt.fn_suffix())));
             quant.insert((fmt, true), mk(&format!("matvec_{}", fmt.fn_suffix())));
             expert.insert(fmt, mk(&format!("matmul_exp_{}", fmt.fn_suffix())));
+        }
+        // Cooperative K-quant kernels: one warp per output row with
+        // lane-consecutive weight loads — the generic lane-strided
+        // walk leaves ~3x bandwidth on the table for K-quants.
+        for (fmt, f) in [
+            (QuantDtype::Q4K, "q4k"),
+            (QuantDtype::Q6K, "q6k"),
+            (QuantDtype::Q2K, "q2k"),
+            (QuantDtype::Q3K, "q3k"),
+        ] {
+            quant.insert((fmt, true), mk(&format!("matvec_{f}_coop")));
+            expert.insert(fmt, mk(&format!("matmul_exp_{f}_coop")));
         }
         let pipelines = Pipelines {
             matmul: mk("matmul"),
@@ -582,6 +597,48 @@ impl WgpuDevice {
         let out = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
         staging.unmap();
         Ok(out)
+    }
+
+    /// Read two buffers back with a single flush + poll — half the
+    /// sync round-trips of two `download` calls. The cpu_moe expert
+    /// path reads (routing table, hidden rows) per MoE layer, where
+    /// per-sync latency dominates decode.
+    pub fn download2(&self, a: &GpuBuffer, b: &GpuBuffer) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.flush();
+        let dev = &self.inner.device;
+        let mk_staging = |len: usize| {
+            dev.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (len * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let sa = mk_staging(a.len);
+        let sb = mk_staging(b.len);
+        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.copy_buffer_to_buffer(&a.buf, 0, &sa, 0, (a.len * 4) as u64);
+        enc.copy_buffer_to_buffer(&b.buf, 0, &sb, 0, (b.len * 4) as u64);
+        self.inner.queue.submit([enc.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx2 = tx.clone();
+        sa.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        sb.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx2.send(r);
+        });
+        dev.poll(wgpu::Maintain::Wait);
+        for _ in 0..2 {
+            rx.recv()
+                .map_err(|e| WgpuError::Readback(e.to_string()))?
+                .map_err(|e| WgpuError::Readback(e.to_string()))?;
+        }
+        let va = bytemuck::cast_slice(&sa.slice(..).get_mapped_range()).to_vec();
+        let vb = bytemuck::cast_slice(&sb.slice(..).get_mapped_range()).to_vec();
+        sa.unmap();
+        sb.unmap();
+        Ok((va, vb))
     }
 
     /// Three-input dispatch; kernels that ignore the auxiliary `c`
@@ -1277,7 +1334,8 @@ impl WgpuDevice {
         let groups = if matvec {
             matvec_groups(w.n)
         } else {
-            ((w.n as u32).div_ceil(16), (m as u32).div_ceil(16), 1)
+            // 16 cols x 16 threads x 8 rows-per-thread per workgroup.
+            ((w.n as u32).div_ceil(16), (m as u32).div_ceil(128), 1)
         };
         self.dispatch(pipeline, x, &w.buf, &out, params, groups);
         Ok(out)
@@ -1890,23 +1948,112 @@ pub struct QuantBuffer {
 
 /// Generated per-format entry points: identical bodies, different dot
 /// function. `params.len` carries the weight row stride in words.
+/// Entry points wrapping the cooperative `<f>_row_coop` warp bodies:
+/// the standard 8-rows-per-workgroup matvec and the expert-indexed
+/// variant (routing table in `c`).
+fn coop_entry_points(f: &str) -> String {
+    format!(
+        r#"
+@compute @workgroup_size(256, 1, 1)
+fn matvec_{f}_coop(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let lane = lid.x % 32u;
+    let sub = lid.x / 32u;
+    let col = (wid.y * 32768u + wid.x) * 8u + sub;
+    var acc: f32 = 0.0;
+    if (col < params.n) {{
+        acc = {f}_row_coop(col * params.len, params.k / 256u, lane, 0u);
+    }}
+    scratch[lid.x] = acc;
+    workgroupBarrier();
+    var stride: u32 = 16u;
+    while (stride > 0u) {{
+        if (lane < stride) {{
+            scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
+        }}
+        workgroupBarrier();
+        stride = stride / 2u;
+    }}
+    if (lane == 0u && col < params.n) {{
+        out[col] = scratch[lid.x];
+    }}
+}}
+
+@compute @workgroup_size(256, 1, 1)
+fn matmul_exp_{f}_coop(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let lane = lid.x % 32u;
+    let sub = lid.x / 32u;
+    let oi = (wid.y * 32768u + wid.x) * 8u + sub;
+    let total = params.m * params.n_heads * params.n;
+    var acc: f32 = 0.0;
+    if (oi < total) {{
+        let col = oi % params.n;
+        let ts = oi / params.n;
+        let t = ts / params.n_heads;
+        let xrow = select(t, ts, (params.flags & 1u) != 0u);
+        let eid = u32(c[ts * 2u]);
+        acc = {f}_row_coop(
+            (eid * params.n + col) * params.len,
+            params.k / 256u,
+            lane,
+            xrow * params.k,
+        );
+    }}
+    scratch[lid.x] = acc;
+    workgroupBarrier();
+    var stride: u32 = 16u;
+    while (stride > 0u) {{
+        if (lane < stride) {{
+            scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
+        }}
+        workgroupBarrier();
+        stride = stride / 2u;
+    }}
+    if (lane == 0u && oi < total) {{
+        out[oi] = scratch[lid.x];
+    }}
+}}
+"#
+    )
+}
+
 fn quant_entry_points(f: &str) -> String {
     format!(
         r#"
 @compute @workgroup_size(16, 16, 1)
 fn matmul_t_{f}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let row = gid.y;
+    // 4 rows per thread: the same weight unit feeds 4 activation rows
+    // while it's L1-hot, cutting the per-row weight re-fetch that made
+    // prefill scale with m instead of with weight bytes.
+    let row0 = gid.y * 8u;
     let col = gid.x;
-    if (row >= params.m || col >= params.n) {{
+    if (row0 >= params.m || col >= params.n) {{
         return;
     }}
+    let m = params.m;
     let units = params.k / 32u;
     let row_word = col * params.len;
-    var acc: f32 = 0.0;
-    for (var u: u32 = 0u; u < units; u = u + 1u) {{
-        acc = acc + dot_{f}(row_word, u, row * params.k + u * 32u);
+    var acc: array<f32, 8>;
+    for (var r: u32 = 0u; r < 8u; r = r + 1u) {{
+        acc[r] = 0.0;
     }}
-    out[row * params.n + col] = acc;
+    for (var u: u32 = 0u; u < units; u = u + 1u) {{
+        let xb = u * 32u;
+        for (var r: u32 = 0u; r < 8u; r = r + 1u) {{
+            let row = min(row0 + r, m - 1u);
+            acc[r] = acc[r] + dot_{f}(row_word, u, row * params.k + xb);
+        }}
+    }}
+    for (var r: u32 = 0u; r < 8u; r = r + 1u) {{
+        if (row0 + r < m) {{
+            out[(row0 + r) * params.n + col] = acc[r];
+        }}
+    }}
 }}
 
 @compute @workgroup_size(256, 1, 1)
@@ -1914,33 +2061,38 @@ fn matvec_{f}(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {{
-    let col = wid.y * 32768u + wid.x;
-    if (col >= params.n) {{
-        return;
-    }}
+    // 8 output columns per workgroup, 32 lanes each: at decode-typical
+    // k (64-512 dot units) every lane has real work and the reduction
+    // runs over 32 lanes — the old one-column-per-workgroup shape
+    // idled most threads and spent its time in 256-wide barriers.
+    let lane = lid.x % 32u;
+    let sub = lid.x / 32u;
+    let col = (wid.y * 32768u + wid.x) * 8u + sub;
     let units = params.k / 32u;
-    let row_word = col * params.len;
     var acc: f32 = 0.0;
-    var u = lid.x;
-    loop {{
-        if (u >= units) {{
-            break;
+    if (col < params.n) {{
+        let row_word = col * params.len;
+        var u = lane;
+        loop {{
+            if (u >= units) {{
+                break;
+            }}
+            acc = acc + dot_{f}(row_word, u, u * 32u);
+            u = u + 32u;
         }}
-        acc = acc + dot_{f}(row_word, u, u * 32u);
-        u = u + 256u;
     }}
     scratch[lid.x] = acc;
     workgroupBarrier();
-    var stride: u32 = 128u;
+    var stride: u32 = 16u;
     while (stride > 0u) {{
-        if (lid.x < stride) {{
+        if (lane < stride) {{
             scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
         }}
         workgroupBarrier();
         stride = stride / 2u;
     }}
-    if (lid.x == 0u && col < params.n) {{
-        out[col] = scratch[0];
+    if (lane == 0u && col < params.n) {{
+        out[col] = scratch[lid.x];
     }}
 }}
 
@@ -1953,54 +2105,56 @@ fn matmul_exp_{f}(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {{
-    let oi = wid.y * 32768u + wid.x;
+    let lane = lid.x % 32u;
+    let sub = lid.x / 32u;
+    let oi = (wid.y * 32768u + wid.x) * 8u + sub;
     let total = params.m * params.n_heads * params.n;
-    if (oi >= total) {{
-        return;
-    }}
-    let col = oi % params.n;
-    let ts = oi / params.n;
-    let t = ts / params.n_heads;
-    // flags bit 0: input rows are per-(token, slot) — the down
-    // projection consumes the per-slot SwiGLU outputs — instead of
-    // per-token.
-    let xrow = select(t, ts, (params.flags & 1u) != 0u);
-    let eid = u32(c[ts * 2u]);
     let units = params.k / 32u;
-    let row_word = (eid * params.n + col) * params.len;
     var acc: f32 = 0.0;
-    var u = lid.x;
-    loop {{
-        if (u >= units) {{
-            break;
+    if (oi < total) {{
+        let col = oi % params.n;
+        let ts = oi / params.n;
+        let t = ts / params.n_heads;
+        // flags bit 0: input rows are per-(token, slot) — the down
+        // projection consumes the per-slot SwiGLU outputs — instead
+        // of per-token.
+        let xrow = select(t, ts, (params.flags & 1u) != 0u);
+        let eid = u32(c[ts * 2u]);
+        let row_word = (eid * params.n + col) * params.len;
+        var u = lane;
+        loop {{
+            if (u >= units) {{
+                break;
+            }}
+            acc = acc + dot_{f}(row_word, u, xrow * params.k + u * 32u);
+            u = u + 32u;
         }}
-        acc = acc + dot_{f}(row_word, u, xrow * params.k + u * 32u);
-        u = u + 256u;
     }}
     scratch[lid.x] = acc;
     workgroupBarrier();
-    var stride2: u32 = 128u;
+    var stride2: u32 = 16u;
     while (stride2 > 0u) {{
-        if (lid.x < stride2) {{
+        if (lane < stride2) {{
             scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride2];
         }}
         workgroupBarrier();
         stride2 = stride2 / 2u;
     }}
-    if (lid.x == 0u) {{
-        out[ts * params.n + col] = scratch[0];
+    if (lane == 0u && oi < total) {{
+        out[oi] = scratch[lid.x];
     }}
 }}
 "#
     )
 }
 
-/// Matvec kernels run one workgroup per output element, addressed as
-/// `wid.y * 32768 + wid.x` — a single dispatch dimension caps at 65535
-/// workgroups, which large-vocab lm_heads (e.g. qwen's 151936) exceed.
+/// Matvec kernels run 8 output elements per workgroup (32 lanes each),
+/// addressed as `wid.y * 32768 + wid.x` — a single dispatch dimension
+/// caps at 65535 workgroups, which large-vocab lm_heads exceed.
 fn matvec_groups(n: usize) -> (u32, u32, u32) {
     const GX: u32 = 32768;
-    ((n as u32).min(GX), (n as u32).div_ceil(GX), 1)
+    let wgs = (n as u32).div_ceil(8);
+    (wgs.min(GX), wgs.div_ceil(GX), 1)
 }
 
 /// Monotonic buffer identity for the bind cache (wgpu itself exposes
@@ -2017,32 +2171,33 @@ fn matvec_f32(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let col = wid.y * 32768u + wid.x;
-    if (col >= params.n) {
-        return;
-    }
-    let row_base = col * params.k;
+    let lane = lid.x % 32u;
+    let sub = lid.x / 32u;
+    let col = (wid.y * 32768u + wid.x) * 8u + sub;
     var acc: f32 = 0.0;
-    var i = lid.x;
-    loop {
-        if (i >= params.k) {
-            break;
+    if (col < params.n) {
+        let row_base = col * params.k;
+        var i = lane;
+        loop {
+            if (i >= params.k) {
+                break;
+            }
+            acc = acc + b[row_base + i] * a[i];
+            i = i + 32u;
         }
-        acc = acc + b[row_base + i] * a[i];
-        i = i + 256u;
     }
     scratch[lid.x] = acc;
     workgroupBarrier();
-    var stride: u32 = 128u;
+    var stride: u32 = 16u;
     while (stride > 0u) {
-        if (lid.x < stride) {
+        if (lane < stride) {
             scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
         }
         workgroupBarrier();
         stride = stride / 2u;
     }
-    if (lid.x == 0u && col < params.n) {
-        out[col] = scratch[0];
+    if (lane == 0u && col < params.n) {
+        out[col] = scratch[lid.x];
     }
 }
 
@@ -2053,38 +2208,39 @@ fn matmul_exp_f32(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let oi = wid.y * 32768u + wid.x;
+    let lane = lid.x % 32u;
+    let sub = lid.x / 32u;
+    let oi = (wid.y * 32768u + wid.x) * 8u + sub;
     let total = params.m * params.n_heads * params.n;
-    if (oi >= total) {
-        return;
-    }
-    let col = oi % params.n;
-    let ts = oi / params.n;
-    let t = ts / params.n_heads;
-    let xrow = select(t, ts, (params.flags & 1u) != 0u);
-    let eid = u32(c[ts * 2u]);
-    let row_base = (eid * params.n + col) * params.k;
     var acc: f32 = 0.0;
-    var i = lid.x;
-    loop {
-        if (i >= params.k) {
-            break;
+    if (oi < total) {
+        let col = oi % params.n;
+        let ts = oi / params.n;
+        let t = ts / params.n_heads;
+        let xrow = select(t, ts, (params.flags & 1u) != 0u);
+        let eid = u32(c[ts * 2u]);
+        let row_base = (eid * params.n + col) * params.k;
+        var i = lane;
+        loop {
+            if (i >= params.k) {
+                break;
+            }
+            acc = acc + b[row_base + i] * a[xrow * params.k + i];
+            i = i + 32u;
         }
-        acc = acc + b[row_base + i] * a[xrow * params.k + i];
-        i = i + 256u;
     }
     scratch[lid.x] = acc;
     workgroupBarrier();
-    var stride: u32 = 128u;
+    var stride: u32 = 16u;
     while (stride > 0u) {
-        if (lid.x < stride) {
+        if (lane < stride) {
             scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
         }
         workgroupBarrier();
         stride = stride / 2u;
     }
-    if (lid.x == 0u) {
-        out[ts * params.n + col] = scratch[0];
+    if (lane == 0u && oi < total) {
+        out[oi] = scratch[lid.x];
     }
 }
 "#;
