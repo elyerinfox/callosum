@@ -185,6 +185,141 @@ fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
     }
 }
 
+/// Where routed expert weights live. Resident: fused and quantized on
+/// the GPU exactly as stored on disk, dequantized in-shader by the
+/// expert-indexed matmul kernels. Host (`cpu_moe` expert offload):
+/// per-expert quantized matmuls in host RAM — the routed expert math
+/// runs on the CPU and only the [seq, hidden] activations cross the
+/// bus, never the weights. Routing itself stays on the GPU either way.
+enum ExpertStore {
+    Resident(Box<ResidentExperts>),
+    Host(Box<HostExperts>),
+}
+
+/// VRAM-resident fused expert weights ([n_experts * rows, cols],
+/// quantized as stored on disk).
+struct ResidentExperts {
+    gates: Weight,
+    ups: Weight,
+    downs: Weight,
+}
+
+/// Byte-sliced per-expert quantized weights on the CPU device — the
+/// same on-disk encoding, so host residency costs GGUF-size RAM.
+pub(crate) struct HostExperts {
+    gates: Vec<callosum::quantized::QMatMul>,
+    ups: Vec<callosum::quantized::QMatMul>,
+    downs: Vec<callosum::quantized::QMatMul>,
+}
+
+impl HostExperts {
+    pub(crate) fn new(
+        gates: Vec<callosum::quantized::QMatMul>,
+        ups: Vec<callosum::quantized::QMatMul>,
+        downs: Vec<callosum::quantized::QMatMul>,
+    ) -> Self {
+        Self { gates, ups, downs }
+    }
+}
+
+/// Slice a fused rank-3 [n_experts, rows, cols] quantized tensor into
+/// per-expert CPU `QMatMul`s over the raw quantized bytes — same
+/// blocks, same scales, no re-encoding.
+pub(crate) fn split_expert_qmatmuls_host(
+    fused: &callosum::quantized::QTensor,
+    n_experts: usize,
+) -> Result<Vec<callosum::quantized::QMatMul>> {
+    use callosum::quantized::{QMatMul, QStorage, QTensor};
+    let cpu = callosum::Device::Cpu;
+    let dims = fused.shape().dims().to_vec();
+    if dims.len() != 3 || dims[0] != n_experts {
+        return Err(WgpuError::Shape(format!(
+            "fused expert tensor must be [{n_experts}, rows, cols], got {dims:?}"
+        )));
+    }
+    let (rows, cols) = (dims[1], dims[2]);
+    let dtype = fused.dtype();
+    let per_expert_elems = rows * cols;
+    if per_expert_elems % dtype.block_size() != 0 {
+        return Err(WgpuError::Shape(format!(
+            "expert slice of {per_expert_elems} elems not block-aligned for {dtype:?}"
+        )));
+    }
+    let per_expert_bytes = per_expert_elems / dtype.block_size() * dtype.type_size();
+    let data = fused
+        .data()
+        .map_err(|e| WgpuError::Device(format!("fused expert bytes: {e}")))?;
+    if data.len() < n_experts * per_expert_bytes {
+        return Err(WgpuError::Shape(format!(
+            "fused expert tensor has {} bytes, expected at least {}",
+            data.len(),
+            n_experts * per_expert_bytes
+        )));
+    }
+    let mut out = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let slice = &data[e * per_expert_bytes..(e + 1) * per_expert_bytes];
+        let storage = QStorage::from_data(std::borrow::Cow::Borrowed(slice), &cpu, dtype)
+            .map_err(|e| WgpuError::Device(format!("expert {e} storage: {e}")))?;
+        let qt = QTensor::new(storage, (rows, cols))
+            .map_err(|e| WgpuError::Device(format!("expert {e} tensor: {e}")))?;
+        out.push(
+            QMatMul::from_qtensor(qt)
+                .map_err(|e| WgpuError::Device(format!("expert {e} matmul: {e}"))),
+        );
+    }
+    out.into_iter().collect()
+}
+
+/// Routed expert FFN on the CPU from a downloaded routing table
+/// ([seq, slots, 2] of (expert_id, weight) — weights already
+/// renormalised and scaled by the GPU top-k kernel) and hidden rows.
+/// Mirrors the CUDA backend's run_moe expert-major batching.
+pub(crate) fn host_moe_forward(
+    hx: &HostExperts,
+    table: &[f32],
+    h2: &[f32],
+    seq: usize,
+    hidden: usize,
+    slots: usize,
+) -> callosum::Result<Vec<f32>> {
+    use callosum::{Device, Module, Tensor};
+    let cpu = Device::Cpu;
+    let x = Tensor::from_vec(h2.to_vec(), (seq, hidden), &cpu)?;
+    let mut by_expert: std::collections::BTreeMap<usize, (Vec<u32>, Vec<f32>)> =
+        std::collections::BTreeMap::new();
+    for t in 0..seq {
+        for s in 0..slots {
+            let e = table[(t * slots + s) * 2] as usize;
+            let w = table[(t * slots + s) * 2 + 1];
+            let entry = by_expert.entry(e).or_default();
+            entry.0.push(t as u32);
+            entry.1.push(w);
+        }
+    }
+    let mut acc = vec![0f32; seq * hidden];
+    for (e, (positions, weights)) in by_expert {
+        let ids = Tensor::new(positions.as_slice(), &cpu)?;
+        let xs = x.index_select(&ids, 0)?; // [n_pos, hidden]
+        let g = hx.gates[e].forward(&xs)?;
+        let u = hx.ups[e].forward(&xs)?;
+        let gated = (g.silu()? * u)?;
+        let out: Vec<f32> = hx.downs[e]
+            .forward(&gated)?
+            .to_dtype(callosum::DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        for (i, &pos) in positions.iter().enumerate() {
+            let w = weights[i];
+            let dst = &mut acc[pos as usize * hidden..(pos as usize + 1) * hidden];
+            for (d, o) in dst.iter_mut().zip(&out[i * hidden..(i + 1) * hidden]) {
+                *d += w * o;
+            }
+        }
+    }
+    Ok(acc)
+}
+
 /// Dense SwiGLU or a mixture-of-experts FFN (qwen3moe). Expert weights
 /// stay fused and quantized on the GPU exactly as stored on disk; the
 /// expert-indexed matmul kernels dequantize the routed expert's rows
@@ -203,12 +338,8 @@ enum Ffn {
         /// V3-style selection bias (`exp_probs_b`) added to the scores
         /// before top-k; mixture weights stay unbiased.
         router_bias: Option<GpuBuffer>,
-        /// Fused [n_experts * ffn_dim, hidden].
-        gates: Weight,
-        /// Fused [n_experts * ffn_dim, hidden].
-        ups: Weight,
-        /// Fused [n_experts * hidden, ffn_dim].
-        downs: Weight,
+        /// Routed expert weights — VRAM-resident or host-offloaded.
+        experts: ExpertStore,
         ffn_dim: usize,
         /// Fused shared experts (glm4moe/deepseek `shexp`), run dense
         /// on the same input and added to the routed mixture.
@@ -252,6 +383,10 @@ pub struct WgpuLlama {
     /// f32 where a format fell back). What a serving layer should
     /// report as resident.
     pub weight_bytes: u64,
+    /// Bytes of expert weights held in host RAM under `cpu_moe`
+    /// offload — excluded from `weight_bytes` (the GPU-resident
+    /// figure) so free-VRAM accounting stays honest.
+    pub host_expert_bytes: u64,
 }
 
 /// Per-conversation KV state: one K and one V buffer per **local**
@@ -309,6 +444,13 @@ impl WgpuLlama {
         Self::from_gguf_stage(path, dev, 0, usize::MAX, true, true)
     }
 
+    /// `from_gguf` with `cpu_moe` expert offload: routed expert
+    /// weights stay quantized in host RAM and the expert FFN math
+    /// runs on the CPU; routing and everything else stays on the GPU.
+    pub fn from_gguf_cpu_moe(path: &std::path::Path, dev: &WgpuDevice) -> Result<Self> {
+        Self::from_gguf_stage_opts(path, dev, 0, usize::MAX, true, true, true)
+    }
+
     /// Load layers `[layer_start, layer_end)` (end clamps to the model's
     /// layer count; `usize::MAX` means "through the last layer").
     /// `owns_input` additionally loads the token embedding, `owns_output`
@@ -321,6 +463,30 @@ impl WgpuLlama {
         layer_end: usize,
         owns_input: bool,
         owns_output: bool,
+    ) -> Result<Self> {
+        Self::from_gguf_stage_opts(
+            path,
+            dev,
+            layer_start,
+            layer_end,
+            owns_input,
+            owns_output,
+            false,
+        )
+    }
+
+    /// [`Self::from_gguf_stage`] plus `cpu_moe`: when set, routed
+    /// expert tensors are byte-sliced into host RAM instead of being
+    /// uploaded, and the expert FFN runs on the CPU per forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gguf_stage_opts(
+        path: &std::path::Path,
+        dev: &WgpuDevice,
+        layer_start: usize,
+        layer_end: usize,
+        owns_input: bool,
+        owns_output: bool,
+        cpu_moe: bool,
     ) -> Result<Self> {
         let mut file =
             std::fs::File::open(path).map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
@@ -403,6 +569,7 @@ impl WgpuLlama {
         // Cheap CPU device for dequantizing non-quant-kernel tensors.
         let cpu = callosum::Device::Cpu;
         let weight_bytes = std::cell::Cell::new(0u64);
+        let host_expert_bytes = std::cell::Cell::new(0u64);
         let mut load_f32 = |name: &str| -> Result<(GpuBuffer, Vec<usize>)> {
             let qt = content
                 .tensor(&mut file, name, &cpu)
@@ -543,11 +710,48 @@ impl WgpuLlama {
                 })?
             };
             let ffn = if has(&format!("blk.{b}.ffn_gate_inp.weight")) {
-                let gates = load_expert_weight(&format!("blk.{b}.ffn_gate_exps.weight"))?;
-                let ffn_dim = match &gates {
-                    // Fused rows = n_experts * ffn_dim.
-                    Weight::F32 { n, .. } => *n / n_experts,
-                    Weight::Quant(q) => q.n / n_experts,
+                let (experts, ffn_dim) = if cpu_moe {
+                    // Expert offload: fused tensors load on the CPU and
+                    // get byte-sliced per expert — never touching VRAM,
+                    // which is the whole point for models whose experts
+                    // don't fit.
+                    let mut file_h = std::fs::File::open(path)
+                        .map_err(|e| WgpuError::Device(format!("open gguf: {e}")))?;
+                    let mut load_host =
+                        |name: String| -> Result<(Vec<callosum::quantized::QMatMul>, usize)> {
+                            let qt = content
+                                .tensor(&mut file_h, &name, &cpu)
+                                .map_err(|e| WgpuError::Device(format!("load {name}: {e}")))?;
+                            let dims = qt.shape().dims().to_vec();
+                            let bytes = qt
+                                .data()
+                                .map_err(|e| WgpuError::Device(format!("{name} bytes: {e}")))?
+                                .len() as u64;
+                            host_expert_bytes.set(host_expert_bytes.get() + bytes);
+                            Ok((split_expert_qmatmuls_host(&qt, n_experts)?, dims[1]))
+                        };
+                    let (gates, ffn_dim) = load_host(format!("blk.{b}.ffn_gate_exps.weight"))?;
+                    let (ups, _) = load_host(format!("blk.{b}.ffn_up_exps.weight"))?;
+                    let (downs, _) = load_host(format!("blk.{b}.ffn_down_exps.weight"))?;
+                    (
+                        ExpertStore::Host(Box::new(HostExperts { gates, ups, downs })),
+                        ffn_dim,
+                    )
+                } else {
+                    let gates = load_expert_weight(&format!("blk.{b}.ffn_gate_exps.weight"))?;
+                    let ffn_dim = match &gates {
+                        // Fused rows = n_experts * ffn_dim.
+                        Weight::F32 { n, .. } => *n / n_experts,
+                        Weight::Quant(q) => q.n / n_experts,
+                    };
+                    (
+                        ExpertStore::Resident(Box::new(ResidentExperts {
+                            gates,
+                            ups: load_expert_weight(&format!("blk.{b}.ffn_up_exps.weight"))?,
+                            downs: load_expert_weight(&format!("blk.{b}.ffn_down_exps.weight"))?,
+                        })),
+                        ffn_dim,
+                    )
                 };
                 let shared = if has(&format!("blk.{b}.ffn_gate_shexp.weight")) {
                     Some(Box::new((
@@ -561,9 +765,7 @@ impl WgpuLlama {
                 Ffn::Moe {
                     router: load_weight(&format!("blk.{b}.ffn_gate_inp.weight"))?,
                     router_bias,
-                    gates,
-                    ups: load_expert_weight(&format!("blk.{b}.ffn_up_exps.weight"))?,
-                    downs: load_expert_weight(&format!("blk.{b}.ffn_down_exps.weight"))?,
+                    experts,
                     ffn_dim,
                     shared,
                 }
@@ -643,6 +845,7 @@ impl WgpuLlama {
             out_norm,
             lm_head,
             weight_bytes: weight_bytes.get(),
+            host_expert_bytes: host_expert_bytes.get(),
         })
     }
 
@@ -856,9 +1059,7 @@ impl WgpuLlama {
                 Ffn::Moe {
                     router,
                     router_bias,
-                    gates,
-                    ups,
-                    downs,
+                    experts,
                     ffn_dim,
                     shared,
                 } => {
@@ -882,17 +1083,37 @@ impl WgpuLlama {
                         cfg.moe_weights_scale,
                     )?;
                     let slots = cfg.n_experts_used;
-                    let g = expert_matmul(
-                        &self.dev, gates, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden, false,
-                    )?;
-                    let u = expert_matmul(
-                        &self.dev, ups, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden, false,
-                    )?;
-                    let gu = self.dev.silu_mul(&g, &u)?;
-                    let d = expert_matmul(
-                        &self.dev, downs, &gu, &routing, seq, slots, cfg.hidden, *ffn_dim, true,
-                    )?;
-                    let routed = self.dev.moe_combine(&d, &routing, seq, slots, cfg.hidden)?;
+                    let routed = match experts {
+                        ExpertStore::Resident(rx) => {
+                            let ResidentExperts { gates, ups, downs } = rx.as_ref();
+                            let g = expert_matmul(
+                                &self.dev, gates, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden,
+                                false,
+                            )?;
+                            let u = expert_matmul(
+                                &self.dev, ups, &h2, &routing, seq, slots, *ffn_dim, cfg.hidden,
+                                false,
+                            )?;
+                            let gu = self.dev.silu_mul(&g, &u)?;
+                            let d = expert_matmul(
+                                &self.dev, downs, &gu, &routing, seq, slots, cfg.hidden, *ffn_dim,
+                                true,
+                            )?;
+                            self.dev.moe_combine(&d, &routing, seq, slots, cfg.hidden)?
+                        }
+                        ExpertStore::Host(hx) => {
+                            // cpu_moe: routing table + hidden rows hop
+                            // to the host, the expert FFN runs on the
+                            // CPU over byte-sliced quantized weights,
+                            // and only the [seq, hidden] result comes
+                            // back — weights never cross the bus.
+                            let table = self.dev.download(&routing)?;
+                            let h2v = self.dev.download(&h2)?;
+                            let out = host_moe_forward(hx, &table, &h2v, seq, cfg.hidden, slots)
+                                .map_err(|e| WgpuError::Device(format!("cpu_moe forward: {e}")))?;
+                            self.dev.upload(&out)
+                        }
+                    };
                     match shared.as_deref() {
                         Some((sg, su, sd)) => {
                             let g = sg.matmul_t(&self.dev, &h2, seq)?;

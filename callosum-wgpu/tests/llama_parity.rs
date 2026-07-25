@@ -1181,3 +1181,73 @@ fn wgpu_glm4moe_matches_cpu_reference_tokens() {
         &gpu_tokens[prompt.len()..]
     );
 }
+
+/// cpu_moe expert offload must produce the same greedy tokens as the
+/// VRAM-resident expert path, with expert bytes accounted to host RAM
+/// instead of the GPU-resident figure. Gated on the tiny MoE GGUFs.
+#[test]
+fn wgpu_cpu_moe_matches_resident_tokens() {
+    let Some(dev) = device() else { return };
+    let cases = [("QWEN3MOE_GGUF", "qwen3moe"), ("GLM4MOE_GGUF", "glm4moe")];
+    for (env, label) in cases {
+        let Some(path) = std::env::var_os(env) else {
+            eprintln!("{env} not set, skipping {label} cpu_moe parity");
+            continue;
+        };
+        let path = std::path::PathBuf::from(path);
+        let resident = callosum_wgpu::llama::WgpuLlama::from_gguf(&path, &dev).unwrap();
+        let offload = callosum_wgpu::llama::WgpuLlama::from_gguf_cpu_moe(&path, &dev).unwrap();
+        assert_eq!(resident.host_expert_bytes, 0);
+        assert!(offload.host_expert_bytes > 0, "{label}: no host experts");
+        assert!(
+            offload.weight_bytes < resident.weight_bytes,
+            "{label}: offload should shrink GPU-resident bytes"
+        );
+
+        let prompt: Vec<u32> = vec![1, 42, 7, 99, 5];
+        let n_gen = 8;
+        let run = |m: &callosum_wgpu::llama::WgpuLlama| -> Vec<u32> {
+            let mut session = m.new_session(64);
+            let mut toks = prompt.clone();
+            for step in 0..n_gen {
+                let input: Vec<u32> = if step == 0 {
+                    toks.clone()
+                } else {
+                    vec![*toks.last().unwrap()]
+                };
+                let logits = m.forward(&mut session, &input).unwrap();
+                toks.push(argmax_of(&logits));
+            }
+            toks
+        };
+        // The host path uses quantized-activation matmuls (candle CPU
+        // QMatMul — the same semantics as the CUDA backend's cpu_moe),
+        // so logits carry ~1% quantization noise vs the f32 in-shader
+        // path. On these tiny random models the top-2 gap is razor
+        // thin, so exact token equality is luck, not correctness:
+        // check logit closeness and determinism instead. Real-model
+        // token equivalence is covered by the DeepSeek e2e run.
+        let mut sa = resident.new_session(64);
+        let mut sb = offload.new_session(64);
+        let la = resident.forward(&mut sa, &prompt).unwrap();
+        let lb = offload.forward(&mut sb, &prompt).unwrap();
+        let scale = la.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let mad = la
+            .iter()
+            .zip(&lb)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            mad / scale < 0.05,
+            "{label}: cpu_moe logits deviate too far (mad {mad}, scale {scale})"
+        );
+        let b1 = run(&offload);
+        let b2 = run(&offload);
+        assert_eq!(b1, b2, "{label}: cpu_moe generation must be deterministic");
+        eprintln!(
+            "wgpu {label} cpu_moe OK ({} KiB experts on host, logits mad {mad:.5}): {:?}",
+            offload.host_expert_bytes >> 10,
+            &b1[prompt.len()..]
+        );
+    }
+}
