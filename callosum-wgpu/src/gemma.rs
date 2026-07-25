@@ -26,7 +26,7 @@
 
 use callosum::quantized::{gguf_file, GgmlDType};
 
-use crate::llama::{HostRowTable, StageInput, StageOutput};
+use crate::llama::{HostRowTable, KvStore, StageInput, StageOutput};
 use crate::{GpuBuffer, QuantBuffer, QuantDtype, Result, WgpuDevice, WgpuError};
 
 pub struct GemmaConfig {
@@ -75,10 +75,17 @@ impl Weight {
 fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
     match d {
         GgmlDType::Q4_0 => Some(QuantDtype::Q4_0),
+        GgmlDType::Q4_1 => Some(QuantDtype::Q4_1),
+        GgmlDType::Q5_0 => Some(QuantDtype::Q5_0),
+        GgmlDType::Q5_1 => Some(QuantDtype::Q5_1),
         GgmlDType::Q8_0 => Some(QuantDtype::Q8_0),
+        GgmlDType::Q2K => Some(QuantDtype::Q2K),
+        GgmlDType::Q3K => Some(QuantDtype::Q3K),
         GgmlDType::Q4K => Some(QuantDtype::Q4K),
         GgmlDType::Q5K => Some(QuantDtype::Q5K),
         GgmlDType::Q6K => Some(QuantDtype::Q6K),
+        GgmlDType::F16 => Some(QuantDtype::F16),
+        GgmlDType::BF16 => Some(QuantDtype::Bf16),
         _ => None,
     }
 }
@@ -150,8 +157,8 @@ pub struct WgpuGemma {
 }
 
 pub struct Session {
-    k: Vec<GpuBuffer>,
-    v: Vec<GpuBuffer>,
+    k: Vec<KvStore>,
+    v: Vec<KvStore>,
     pub len: usize,
     max_seq: usize,
 }
@@ -491,17 +498,18 @@ impl WgpuGemma {
     }
 
     pub fn new_session(&self, max_seq: usize) -> Session {
+        self.new_session_opts(max_seq, false)
+    }
+
+    /// [`Self::new_session`] with an optional int8 KV cache.
+    pub fn new_session_opts(&self, max_seq: usize, kv_int8: bool) -> Session {
+        let mk = |b: &Block| {
+            let int8 = kv_int8 && b.head_dim.is_multiple_of(4);
+            KvStore::alloc(&self.dev, max_seq, b.n_kv_heads, b.head_dim, int8)
+        };
         Session {
-            k: self
-                .blocks
-                .iter()
-                .map(|b| self.dev.alloc(max_seq * b.n_kv_heads * b.head_dim))
-                .collect(),
-            v: self
-                .blocks
-                .iter()
-                .map(|b| self.dev.alloc(max_seq * b.n_kv_heads * b.head_dim))
-                .collect(),
+            k: self.blocks.iter().map(mk).collect(),
+            v: self.blocks.iter().map(mk).collect(),
             len: 0,
             max_seq,
         }
@@ -609,7 +617,6 @@ impl WgpuGemma {
             let b_abs = cfg.layer_start + li;
             let hd = blk.head_dim;
             let n_kv = blk.n_kv_heads;
-            let kv_row = n_kv * hd;
             let freqs = if blk.use_freqs {
                 self.rope_freqs.as_ref()
             } else {
@@ -640,7 +647,7 @@ impl WgpuGemma {
             )?;
 
             let reuses = matches!(cfg.n_layer_kv_from_start, Some(nk) if b_abs >= nk);
-            let (k_buf, v_buf): (&GpuBuffer, &GpuBuffer) = if reuses {
+            let (k_buf, v_buf): (&KvStore, &KvStore) = if reuses {
                 let is_swa = cfg.key_length_swa == Some(hd);
                 let src_abs = if is_swa {
                     shared_swa_src.unwrap()
@@ -675,8 +682,8 @@ impl WgpuGemma {
                 let k = self
                     .dev
                     .rope_scaled(&k, seq, n_kv, hd, pos0, blk.theta, false, 1.0, freqs, hd)?;
-                self.dev.copy_rows(&k, &session.k[li], pos0, seq, kv_row)?;
-                self.dev.copy_rows(&v, &session.v[li], pos0, seq, kv_row)?;
+                session.k[li].append(&self.dev, &k, pos0, seq, n_kv, hd)?;
+                session.v[li].append(&self.dev, &v, pos0, seq, n_kv, hd)?;
                 (&session.k[li], &session.v[li])
             };
 
@@ -685,9 +692,9 @@ impl WgpuGemma {
             } else {
                 1.0 / (hd as f32).sqrt()
             };
-            let scores = self.dev.attn_scores_opt(
+            let scores = k_buf.attn_scores(
+                &self.dev,
                 &q,
-                k_buf,
                 seq,
                 kv_len,
                 cfg.n_heads,
@@ -707,9 +714,7 @@ impl WgpuGemma {
                 None => scores,
             };
             let probs = self.dev.softmax(&scores, cfg.n_heads * seq, kv_len)?;
-            let att = self
-                .dev
-                .attn_out(&probs, v_buf, seq, kv_len, cfg.n_heads, n_kv, hd)?;
+            let att = v_buf.attn_out(&self.dev, &probs, seq, kv_len, cfg.n_heads, n_kv, hd)?;
             let o = blk.wo.matmul_t(&self.dev, &att, seq)?;
             let o = match &blk.post_attn_norm {
                 Some(w) => self.dev.rms_norm(&o, w, seq, cfg.hidden, cfg.rms_eps)?,

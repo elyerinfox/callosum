@@ -579,6 +579,114 @@ fn attn_scores(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Attention output:
 //   out[sq, h, d] = Σ_sk probs[h, sq, sk] · Vcache[sk, kv(h), d]
 // probs in `a` ([n_heads, seq_q, kv_len]), V cache in `b`.
+// ---- int8 KV cache (SPLITBRAIN_KV_DTYPE=int8) ----
+// Encoding mirrors the CUDA backend's QuantizedKv: per-(token, head)
+// symmetric scale = max(|x|, 1e-8)/127, stored offset-uint8
+// (clamp(round(x/scale), -127, 127) + 128), packed 4 bytes per u32
+// word bitcast into the f32 cache buffer. head_dim % 4 == 0 keeps a
+// word inside one head so all 4 bytes share a scale.
+
+// Pass 1: per-(token, head) scales. a = source rows
+// [m, n_kv_heads, head_dim]; out = scale cache, written at
+// (pos0 + t) * n_kv_heads + h.
+@compute @workgroup_size(256, 1, 1)
+fn kv_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let total = params.m * params.n_kv_heads;
+    if (i >= total) {
+        return;
+    }
+    let h = i % params.n_kv_heads;
+    let t = i / params.n_kv_heads;
+    let base = (t * params.n_kv_heads + h) * params.head_dim;
+    var mx: f32 = 0.0;
+    for (var d: u32 = 0u; d < params.head_dim; d = d + 1u) {
+        mx = max(mx, abs(a[base + d]));
+    }
+    out[(params.pos0 + t) * params.n_kv_heads + h] = max(mx, 1.0e-8) / 127.0;
+}
+
+// Pass 2: quantise + pack. a = source rows, b = scale cache; out =
+// packed q cache. One thread per output word.
+@compute @workgroup_size(256, 1, 1)
+fn kv_quant(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let row = params.n_kv_heads * params.head_dim;
+    let total = params.m * row / 4u;
+    if (i >= total) {
+        return;
+    }
+    let e0 = i * 4u;
+    let t = e0 / row;
+    let h = (e0 % row) / params.head_dim;
+    let sc = b[(params.pos0 + t) * params.n_kv_heads + h];
+    var w: u32 = 0u;
+    for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+        let q = clamp(round(a[e0 + j] / sc), -127.0, 127.0) + 128.0;
+        w = w | (u32(q) << (8u * j));
+    }
+    out[params.pos0 * row / 4u + i] = bitcast<f32>(w);
+}
+
+// attn_scores over an int8 K cache: b = packed q, c = scales.
+@compute @workgroup_size(256, 1, 1)
+fn attn_scores_q8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.n_heads * params.m * params.k;
+    if (idx >= total) {
+        return;
+    }
+    let sk = idx % params.k;
+    let rem = idx / params.k;
+    let sq = rem % params.m;
+    let h = rem / params.m;
+    if (sk > params.pos0 + sq) {
+        out[idx] = -3.0e38;
+        return;
+    }
+    if (params.window > 0u && sk + params.window <= params.pos0 + sq) {
+        out[idx] = -3.0e38;
+        return;
+    }
+    let kv_h = h / (params.n_heads / params.n_kv_heads);
+    let qbase = (sq * params.n_heads + h) * params.head_dim;
+    let kbase = (sk * params.n_kv_heads + kv_h) * params.head_dim;
+    let sc = c[sk * params.n_kv_heads + kv_h];
+    var acc: f32 = 0.0;
+    for (var d: u32 = 0u; d < params.head_dim; d = d + 4u) {
+        let w = bitcast<u32>(b[(kbase + d) / 4u]);
+        acc = acc + a[qbase + d]      * (f32( w        & 0xffu) - 128.0);
+        acc = acc + a[qbase + d + 1u] * (f32((w >>  8u) & 0xffu) - 128.0);
+        acc = acc + a[qbase + d + 2u] * (f32((w >> 16u) & 0xffu) - 128.0);
+        acc = acc + a[qbase + d + 3u] * (f32((w >> 24u) & 0xffu) - 128.0);
+    }
+    out[idx] = acc * sc * params.scale;
+}
+
+// attn_out over an int8 V cache: b = packed q, c = scales.
+@compute @workgroup_size(256, 1, 1)
+fn attn_out_q8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.m * params.n_heads * params.head_dim;
+    if (idx >= total) {
+        return;
+    }
+    let d = idx % params.head_dim;
+    let rem = idx / params.head_dim;
+    let h = rem % params.n_heads;
+    let sq = rem / params.n_heads;
+    let kv_h = h / (params.n_heads / params.n_kv_heads);
+    var acc: f32 = 0.0;
+    for (var sk: u32 = 0u; sk < params.k; sk = sk + 1u) {
+        let p = a[(h * params.m + sq) * params.k + sk];
+        let e = (sk * params.n_kv_heads + kv_h) * params.head_dim + d;
+        let w = bitcast<u32>(b[e / 4u]);
+        let q = f32((w >> (8u * (e % 4u))) & 0xffu) - 128.0;
+        acc = acc + p * q * c[sk * params.n_kv_heads + kv_h];
+    }
+    out[(sq * params.n_heads + h) * params.head_dim + d] = acc;
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn attn_out(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;

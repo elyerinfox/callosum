@@ -16,7 +16,7 @@
 use callosum::quantized::{gguf_file, GgmlDType};
 
 use crate::llama::{
-    host_moe_forward, split_expert_qmatmuls_host, HostExperts, HostRowTable, StageInput,
+    host_moe_forward, split_expert_qmatmuls_host, HostExperts, HostRowTable, KvStore, StageInput,
     StageOutput,
 };
 use crate::{GpuBuffer, QuantBuffer, QuantDtype, Result, WgpuDevice, WgpuError};
@@ -68,10 +68,17 @@ impl Weight {
 fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
     match d {
         GgmlDType::Q4_0 => Some(QuantDtype::Q4_0),
+        GgmlDType::Q4_1 => Some(QuantDtype::Q4_1),
+        GgmlDType::Q5_0 => Some(QuantDtype::Q5_0),
+        GgmlDType::Q5_1 => Some(QuantDtype::Q5_1),
         GgmlDType::Q8_0 => Some(QuantDtype::Q8_0),
+        GgmlDType::Q2K => Some(QuantDtype::Q2K),
+        GgmlDType::Q3K => Some(QuantDtype::Q3K),
         GgmlDType::Q4K => Some(QuantDtype::Q4K),
         GgmlDType::Q5K => Some(QuantDtype::Q5K),
         GgmlDType::Q6K => Some(QuantDtype::Q6K),
+        GgmlDType::F16 => Some(QuantDtype::F16),
+        GgmlDType::BF16 => Some(QuantDtype::Bf16),
         _ => None,
     }
 }
@@ -140,8 +147,8 @@ pub struct WgpuDeepSeek {
 }
 
 pub struct Session {
-    k: Vec<GpuBuffer>,
-    v: Vec<GpuBuffer>,
+    k: Vec<KvStore>,
+    v: Vec<KvStore>,
     pub len: usize,
     max_seq: usize,
 }
@@ -501,18 +508,25 @@ impl WgpuDeepSeek {
     }
 
     pub fn new_session(&self, max_seq: usize) -> Session {
-        let k_row = self.cfg.n_heads * (self.cfg.nope_dim + self.cfg.rope_dim);
-        let v_row = self.cfg.n_heads * self.cfg.v_dim;
+        self.new_session_opts(max_seq, false)
+    }
+
+    /// [`Self::new_session`] with an optional int8 KV cache. The K and
+    /// V per-head widths differ under MLA (nope+rope vs v_dim); both
+    /// get per-(token, head) scales.
+    pub fn new_session_opts(&self, max_seq: usize, kv_int8: bool) -> Session {
+        let k_head = self.cfg.nope_dim + self.cfg.rope_dim;
+        let int8 = kv_int8 && k_head.is_multiple_of(4) && self.cfg.v_dim.is_multiple_of(4);
         Session {
             k: self
                 .blocks
                 .iter()
-                .map(|_| self.dev.alloc(max_seq * k_row))
+                .map(|_| KvStore::alloc(&self.dev, max_seq, self.cfg.n_heads, k_head, int8))
                 .collect(),
             v: self
                 .blocks
                 .iter()
-                .map(|_| self.dev.alloc(max_seq * v_row))
+                .map(|_| KvStore::alloc(&self.dev, max_seq, self.cfg.n_heads, self.cfg.v_dim, int8))
                 .collect(),
             len: 0,
             max_seq,
@@ -556,7 +570,6 @@ impl WgpuDeepSeek {
         let kv_len = pos0 + seq;
         let q_head = cfg.nope_dim + cfg.rope_dim;
         let k_row = cfg.n_heads * q_head;
-        let v_row = cfg.n_heads * cfg.v_dim;
 
         self.dev.begin_batch();
         let mut x = match input {
@@ -684,13 +697,12 @@ impl WgpuDeepSeek {
                 cfg.rope_dim,
                 cfg.n_heads,
             )?;
-            self.dev
-                .copy_rows(&k_full, &session.k[li], pos0, seq, k_row)?;
-            self.dev.copy_rows(&v, &session.v[li], pos0, seq, v_row)?;
+            session.k[li].append(&self.dev, &k_full, pos0, seq, cfg.n_heads, q_head)?;
+            session.v[li].append(&self.dev, &v, pos0, seq, cfg.n_heads, cfg.v_dim)?;
 
-            let scores = self.dev.attn_scores_opt(
+            let scores = session.k[li].attn_scores(
+                &self.dev,
                 &q_full,
-                &session.k[li],
                 seq,
                 kv_len,
                 cfg.n_heads,
@@ -701,9 +713,9 @@ impl WgpuDeepSeek {
                 0,
             )?;
             let probs = self.dev.softmax(&scores, cfg.n_heads * seq, kv_len)?;
-            let att = self.dev.attn_out(
+            let att = session.v[li].attn_out(
+                &self.dev,
                 &probs,
-                &session.v[li],
                 seq,
                 kv_len,
                 cfg.n_heads,

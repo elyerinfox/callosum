@@ -177,10 +177,17 @@ fn expert_matmul(
 fn quant_dtype(d: GgmlDType) -> Option<QuantDtype> {
     match d {
         GgmlDType::Q4_0 => Some(QuantDtype::Q4_0),
+        GgmlDType::Q4_1 => Some(QuantDtype::Q4_1),
+        GgmlDType::Q5_0 => Some(QuantDtype::Q5_0),
+        GgmlDType::Q5_1 => Some(QuantDtype::Q5_1),
         GgmlDType::Q8_0 => Some(QuantDtype::Q8_0),
+        GgmlDType::Q2K => Some(QuantDtype::Q2K),
+        GgmlDType::Q3K => Some(QuantDtype::Q3K),
         GgmlDType::Q4K => Some(QuantDtype::Q4K),
         GgmlDType::Q5K => Some(QuantDtype::Q5K),
         GgmlDType::Q6K => Some(QuantDtype::Q6K),
+        GgmlDType::F16 => Some(QuantDtype::F16),
+        GgmlDType::BF16 => Some(QuantDtype::Bf16),
         _ => None,
     }
 }
@@ -389,13 +396,108 @@ pub struct WgpuLlama {
     pub host_expert_bytes: u64,
 }
 
-/// Per-conversation KV state: one K and one V buffer per **local**
+/// One layer's K or V history: dense f32, or int8 with per-(token,
+/// head) scales (`SPLITBRAIN_KV_DTYPE=int8` — same encoding as the
+/// CUDA backend's QuantizedKv, ~4x smaller than f32).
+pub(crate) enum KvStore {
+    F32(GpuBuffer),
+    Q8 { data: GpuBuffer, scale: GpuBuffer },
+}
+
+impl KvStore {
+    pub(crate) fn alloc(
+        dev: &WgpuDevice,
+        max_seq: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        int8: bool,
+    ) -> Self {
+        if int8 {
+            Self::Q8 {
+                data: dev.alloc(max_seq * kv_heads * head_dim / 4),
+                scale: dev.alloc(max_seq * kv_heads),
+            }
+        } else {
+            Self::F32(dev.alloc(max_seq * kv_heads * head_dim))
+        }
+    }
+
+    /// Append `seq` rows of [kv_heads, head_dim] at token `pos0`.
+    pub(crate) fn append(
+        &self,
+        dev: &WgpuDevice,
+        src: &GpuBuffer,
+        pos0: usize,
+        seq: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        match self {
+            Self::F32(buf) => dev.copy_rows(src, buf, pos0, seq, kv_heads * head_dim),
+            Self::Q8 { data, scale } => {
+                dev.kv_quant_append(src, data, scale, pos0, seq, kv_heads, head_dim)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_scores(
+        &self,
+        dev: &WgpuDevice,
+        q: &GpuBuffer,
+        seq_q: usize,
+        kv_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos0: usize,
+        scale: f32,
+        window: usize,
+    ) -> Result<GpuBuffer> {
+        match self {
+            Self::F32(buf) => dev.attn_scores_opt(
+                q, buf, seq_q, kv_len, heads, kv_heads, head_dim, pos0, scale, window,
+            ),
+            Self::Q8 { data, scale: sc } => dev.attn_scores_q8_opt(
+                q, data, sc, seq_q, kv_len, heads, kv_heads, head_dim, pos0, scale, window,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_out(
+        &self,
+        dev: &WgpuDevice,
+        probs: &GpuBuffer,
+        seq_q: usize,
+        kv_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<GpuBuffer> {
+        match self {
+            Self::F32(buf) => dev.attn_out(probs, buf, seq_q, kv_len, heads, kv_heads, head_dim),
+            Self::Q8 { data, scale } => {
+                dev.attn_out_q8(probs, data, scale, seq_q, kv_len, heads, kv_heads, head_dim)
+            }
+        }
+    }
+}
+
+/// Per-conversation KV state: one K and one V store per **local**
 /// layer, laid out [max_seq, n_kv_heads, head_dim], appended in place.
 pub struct Session {
-    k: Vec<GpuBuffer>,
-    v: Vec<GpuBuffer>,
+    k: Vec<KvStore>,
+    v: Vec<KvStore>,
     pub len: usize,
     max_seq: usize,
+}
+
+impl Session {
+    /// True when this session stores its KV history as int8.
+    pub fn kv_int8(&self) -> bool {
+        matches!(self.k.first(), Some(KvStore::Q8 { .. }))
+    }
 }
 
 /// What a pipeline stage receives: tokens on the stage owning the
@@ -850,14 +952,26 @@ impl WgpuLlama {
     }
 
     pub fn new_session(&self, max_seq: usize) -> Session {
-        let kv_row = self.cfg.n_kv_heads * self.cfg.head_dim;
+        self.new_session_opts(max_seq, false)
+    }
+
+    /// [`Self::new_session`] with an optional int8 KV cache (~4x
+    /// smaller). Falls back to f32 when head_dim isn't word-aligned
+    /// (packing needs head_dim % 4 == 0 — true for every real arch).
+    pub fn new_session_opts(&self, max_seq: usize, kv_int8: bool) -> Session {
+        let int8 = kv_int8 && self.cfg.head_dim.is_multiple_of(4);
+        let mk = |_: usize| {
+            KvStore::alloc(
+                &self.dev,
+                max_seq,
+                self.cfg.n_kv_heads,
+                self.cfg.head_dim,
+                int8,
+            )
+        };
         Session {
-            k: (0..self.blocks.len())
-                .map(|_| self.dev.alloc(max_seq * kv_row))
-                .collect(),
-            v: (0..self.blocks.len())
-                .map(|_| self.dev.alloc(max_seq * kv_row))
-                .collect(),
+            k: (0..self.blocks.len()).map(mk).collect(),
+            v: (0..self.blocks.len()).map(mk).collect(),
             len: 0,
             max_seq,
         }
@@ -925,7 +1039,6 @@ impl WgpuLlama {
         }
         let pos0 = session.len;
         let kv_len = pos0 + seq;
-        let kv_row = cfg.n_kv_heads * cfg.head_dim;
 
         // One command buffer for the whole forward — the readback at
         // the end flushes it.
@@ -1001,23 +1114,25 @@ impl WgpuLlama {
                 None,
                 cfg.rot_dim,
             )?;
-            self.dev.copy_rows(&k, &session.k[li], pos0, seq, kv_row)?;
-            self.dev.copy_rows(&v, &session.v[li], pos0, seq, kv_row)?;
+            session.k[li].append(&self.dev, &k, pos0, seq, cfg.n_kv_heads, cfg.head_dim)?;
+            session.v[li].append(&self.dev, &v, pos0, seq, cfg.n_kv_heads, cfg.head_dim)?;
 
-            let scores = self.dev.attn_scores(
+            let scores = session.k[li].attn_scores(
+                &self.dev,
                 &q,
-                &session.k[li],
                 seq,
                 kv_len,
                 cfg.n_heads,
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 pos0,
+                1.0 / (cfg.head_dim as f32).sqrt(),
+                0,
             )?;
             let probs = self.dev.softmax(&scores, cfg.n_heads * seq, kv_len)?;
-            let att = self.dev.attn_out(
+            let att = session.v[li].attn_out(
+                &self.dev,
                 &probs,
-                &session.v[li],
                 seq,
                 kv_len,
                 cfg.n_heads,

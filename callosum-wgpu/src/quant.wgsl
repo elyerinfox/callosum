@@ -93,6 +93,196 @@ fn dot_q8_0(row_word: u32, unit: u32, x_base: u32) -> f32 {
     return acc * d;
 }
 
+// ---- q4_1: 32 elems = f16 d + f16 m + 16 nibble bytes (20 B) ----
+
+fn dot_q4_1(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let base = unit * 20u;
+    let d = f16at(row_word, base);
+    let m = f16at(row_word, base + 2u);
+    var qdot: f32 = 0.0;
+    var xsum: f32 = 0.0;
+    for (var l: u32 = 0u; l < 16u; l = l + 4u) {
+        let w = u32at(row_word, base + 4u + l);
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let byte = (w >> (8u * j)) & 0xFFu;
+            let x0 = a[x_base + l + j];
+            let x1 = a[x_base + 16u + l + j];
+            qdot = qdot + f32(byte & 0xFu) * x0 + f32(byte >> 4u) * x1;
+            xsum = xsum + x0 + x1;
+        }
+    }
+    return d * qdot + m * xsum;
+}
+
+// ---- q5_0: 32 elems = f16 d + u32 qh + 16 nibble bytes (22 B) ----
+
+fn dot_q5_0(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let base = unit * 22u;
+    let d = f16at(row_word, base);
+    let qh = u32at(row_word, base + 2u);
+    var acc: f32 = 0.0;
+    for (var l: u32 = 0u; l < 16u; l = l + 4u) {
+        let w = u32at(row_word, base + 6u + l);
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let byte = (w >> (8u * j)) & 0xFFu;
+            let q0 = (byte & 0xFu) | (((qh >> (l + j)) & 1u) << 4u);
+            let q1 = (byte >> 4u) | (((qh >> (l + j + 16u)) & 1u) << 4u);
+            acc = acc + (f32(q0) - 16.0) * a[x_base + l + j];
+            acc = acc + (f32(q1) - 16.0) * a[x_base + 16u + l + j];
+        }
+    }
+    return acc * d;
+}
+
+// ---- q5_1: 32 elems = f16 d + f16 m + u32 qh + 16 nibbles (24 B) ----
+
+fn dot_q5_1(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let base = unit * 24u;
+    let d = f16at(row_word, base);
+    let m = f16at(row_word, base + 2u);
+    let qh = u32at(row_word, base + 4u);
+    var qdot: f32 = 0.0;
+    var xsum: f32 = 0.0;
+    for (var l: u32 = 0u; l < 16u; l = l + 4u) {
+        let w = u32at(row_word, base + 8u + l);
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let byte = (w >> (8u * j)) & 0xFFu;
+            let q0 = (byte & 0xFu) | (((qh >> (l + j)) & 1u) << 4u);
+            let q1 = (byte >> 4u) | (((qh >> (l + j + 16u)) & 1u) << 4u);
+            let x0 = a[x_base + l + j];
+            let x1 = a[x_base + 16u + l + j];
+            qdot = qdot + f32(q0) * x0 + f32(q1) * x1;
+            xsum = xsum + x0 + x1;
+        }
+    }
+    return d * qdot + m * xsum;
+}
+
+// ---- f16 / bf16: 32 elems stored dense (64 B) ----
+
+fn dot_f16(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let base = unit * 64u;
+    var acc: f32 = 0.0;
+    for (var l: u32 = 0u; l < 32u; l = l + 2u) {
+        let w = u32at(row_word, base + 2u * l);
+        let v = unpack2x16float(w);
+        acc = acc + v.x * a[x_base + l] + v.y * a[x_base + l + 1u];
+    }
+    return acc;
+}
+
+fn dot_bf16(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let base = unit * 64u;
+    var acc: f32 = 0.0;
+    for (var l: u32 = 0u; l < 32u; l = l + 2u) {
+        let w = u32at(row_word, base + 2u * l);
+        acc = acc + bitcast<f32>((w & 0xFFFFu) << 16u) * a[x_base + l];
+        acc = acc + bitcast<f32>(w & 0xFFFF0000u) * a[x_base + l + 1u];
+    }
+    return acc;
+}
+
+// ---- q2_K: super-block of 256 = scales[16], qs[64], d, dmin (84 B).
+// Per 16-element group: 4-bit scale (low nibble) on d, 4-bit min
+// (high nibble) on dmin; 2-bit quants, shift = 2 * (group pair). ----
+
+fn dot_q2_k(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let sb = unit / 8u;
+    let u = unit % 8u;
+    let base = sb * 84u;
+    let d = f16at(row_word, base + 80u);
+    let dmin = f16at(row_word, base + 82u);
+    let half = u / 4u;
+    let j2 = u % 4u;
+    let shift = 2u * j2;
+    let sc0 = bget(row_word, base + half * 8u + j2 * 2u);
+    let sc1 = bget(row_word, base + half * 8u + j2 * 2u + 1u);
+    let qb = base + 16u + 32u * half;
+    var acc0: f32 = 0.0;
+    var xs0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    var xs1: f32 = 0.0;
+    for (var l: u32 = 0u; l < 16u; l = l + 4u) {
+        let w0 = u32at(row_word, qb + l);
+        let w1 = u32at(row_word, qb + 16u + l);
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let x0 = a[x_base + l + j];
+            let x1 = a[x_base + 16u + l + j];
+            acc0 = acc0 + f32(((w0 >> (8u * j)) >> shift) & 3u) * x0;
+            xs0 = xs0 + x0;
+            acc1 = acc1 + f32(((w1 >> (8u * j)) >> shift) & 3u) * x1;
+            xs1 = xs1 + x1;
+        }
+    }
+    return d * (f32(sc0 & 0xFu) * acc0 + f32(sc1 & 0xFu) * acc1)
+        - dmin * (f32(sc0 >> 4u) * xs0 + f32(sc1 >> 4u) * xs1);
+}
+
+// ---- q3_K: super-block of 256 = hmask[32], qs[64], scales[12], d
+// (110 B). 3-bit quants: 2 low bits from qs, high bit from hmask
+// (offset -4 when the mask bit is clear); 6-bit scales unpacked via
+// ggml's kmask transform, value - 32. ----
+
+fn q3k_scale(row_word: u32, base: u32, is: u32) -> f32 {
+    let kmask1 = 0x03030303u;
+    let kmask2 = 0x0f0f0f0fu;
+    let a0 = u32at(row_word, base + 96u);
+    let a1 = u32at(row_word, base + 100u);
+    let t = u32at(row_word, base + 104u);
+    var word: u32;
+    switch is / 4u {
+        case 0u: {
+            word = (a0 & kmask2) | ((t & kmask1) << 4u);
+        }
+        case 1u: {
+            word = (a1 & kmask2) | (((t >> 2u) & kmask1) << 4u);
+        }
+        case 2u: {
+            word = ((a0 >> 4u) & kmask2) | (((t >> 4u) & kmask1) << 4u);
+        }
+        default: {
+            word = ((a1 >> 4u) & kmask2) | (((t >> 6u) & kmask1) << 4u);
+        }
+    }
+    return f32((word >> (8u * (is % 4u))) & 0xFFu) - 32.0;
+}
+
+fn dot_q3_k(row_word: u32, unit: u32, x_base: u32) -> f32 {
+    let sb = unit / 8u;
+    let u = unit % 8u;
+    let base = sb * 110u;
+    let d = f16at(row_word, base + 108u);
+    let half = u / 4u;
+    let j2 = u % 4u;
+    let shift = 2u * j2;
+    let hbit = half * 4u + j2;
+    let is = half * 8u + j2 * 2u;
+    let s0 = q3k_scale(row_word, base, is);
+    let s1 = q3k_scale(row_word, base, is + 1u);
+    let qb = base + 32u + 32u * half;
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    for (var l: u32 = 0u; l < 16u; l = l + 4u) {
+        let w0 = u32at(row_word, qb + l);
+        let w1 = u32at(row_word, qb + 16u + l);
+        let h0 = u32at(row_word, base + l);
+        let h1 = u32at(row_word, base + 16u + l);
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            var q0 = f32(((w0 >> (8u * j)) >> shift) & 3u);
+            if ((((h0 >> (8u * j)) >> hbit) & 1u) == 0u) {
+                q0 = q0 - 4.0;
+            }
+            var q1 = f32(((w1 >> (8u * j)) >> shift) & 3u);
+            if ((((h1 >> (8u * j)) >> hbit) & 1u) == 0u) {
+                q1 = q1 - 4.0;
+            }
+            acc0 = acc0 + q0 * a[x_base + l + j];
+            acc1 = acc1 + q1 * a[x_base + 16u + l + j];
+        }
+    }
+    return d * (s0 * acc0 + s1 * acc1);
+}
+
 // ---- K-quant shared: 6-bit (scale, min) pairs, ggml get_scale_min_k4 ----
 
 fn scale_min_k4(row_word: u32, scales_off: u32, j: u32) -> vec2<f32> {

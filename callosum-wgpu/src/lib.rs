@@ -107,6 +107,10 @@ struct Pipelines {
     rope_interleaved: wgpu::ComputePipeline,
     rope_half: wgpu::ComputePipeline,
     attn_scores: wgpu::ComputePipeline,
+    attn_scores_q8: wgpu::ComputePipeline,
+    attn_out_q8: wgpu::ComputePipeline,
+    kv_scale: wgpu::ComputePipeline,
+    kv_quant: wgpu::ComputePipeline,
     attn_out: wgpu::ComputePipeline,
     copy_to: wgpu::ComputePipeline,
     silu_mul: wgpu::ComputePipeline,
@@ -474,6 +478,10 @@ impl WgpuDevice {
             rope_interleaved: mk("rope_interleaved"),
             rope_half: mk("rope_half"),
             attn_scores: mk("attn_scores"),
+            attn_scores_q8: mk("attn_scores_q8"),
+            attn_out_q8: mk("attn_out_q8"),
+            kv_scale: mk("kv_scale"),
+            kv_quant: mk("kv_quant"),
             attn_out: mk("attn_out"),
             copy_to: mk("copy_to"),
             silu_mul: mk("silu_mul"),
@@ -1503,6 +1511,150 @@ impl WgpuDevice {
         Ok(out)
     }
 
+    /// Quantise-append `seq` rows of [kv_heads, head_dim] f32 into an
+    /// int8 KV cache at token position `pos0`: per-(token, head)
+    /// scales into `scale_dst`, offset-uint8 values packed 4-per-word
+    /// into `q_dst`. Requires head_dim % 4 == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_quant_append(
+        &self,
+        src: &GpuBuffer,
+        q_dst: &GpuBuffer,
+        scale_dst: &GpuBuffer,
+        pos0: usize,
+        seq: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        let row = kv_heads * head_dim;
+        if !head_dim.is_multiple_of(4) {
+            return Err(WgpuError::Shape(format!(
+                "int8 KV needs head_dim % 4 == 0, got {head_dim}"
+            )));
+        }
+        if src.len < seq * row
+            || q_dst.len < (pos0 + seq) * row / 4
+            || scale_dst.len < (pos0 + seq) * kv_heads
+        {
+            return Err(WgpuError::Shape("kv_quant_append: out of bounds".into()));
+        }
+        let params = Params {
+            m: seq as u32,
+            n_kv_heads: kv_heads as u32,
+            head_dim: head_dim as u32,
+            pos0: pos0 as u32,
+            ..Default::default()
+        };
+        let scale_threads = (seq * kv_heads) as u32;
+        self.dispatch(
+            &self.inner.pipelines.kv_scale,
+            src,
+            src,
+            scale_dst,
+            params,
+            (scale_threads.div_ceil(256), 1, 1),
+        );
+        let quant_threads = (seq * row / 4) as u32;
+        self.dispatch(
+            &self.inner.pipelines.kv_quant,
+            src,
+            scale_dst,
+            q_dst,
+            params,
+            (quant_threads.div_ceil(256), 1, 1),
+        );
+        Ok(())
+    }
+
+    /// [`Self::attn_scores_opt`] over an int8 K cache (packed q +
+    /// per-(token, head) scales).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_scores_q8_opt(
+        &self,
+        q: &GpuBuffer,
+        k_q: &GpuBuffer,
+        k_scale: &GpuBuffer,
+        seq_q: usize,
+        kv_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos0: usize,
+        scale: f32,
+        window: usize,
+    ) -> Result<GpuBuffer> {
+        if q.len != seq_q * heads * head_dim
+            || k_q.len * 4 < kv_len * kv_heads * head_dim
+            || k_scale.len < kv_len * kv_heads
+        {
+            return Err(WgpuError::Shape("attn_scores_q8: shape mismatch".into()));
+        }
+        let out = self.alloc_out(heads * seq_q * kv_len);
+        let params = Params {
+            m: seq_q as u32,
+            k: kv_len as u32,
+            n_heads: heads as u32,
+            n_kv_heads: kv_heads as u32,
+            head_dim: head_dim as u32,
+            pos0: pos0 as u32,
+            scale,
+            window: window as u32,
+            ..Default::default()
+        };
+        let total = (heads * seq_q * kv_len) as u32;
+        self.dispatch4(
+            &self.inner.pipelines.attn_scores_q8,
+            q,
+            k_q,
+            k_scale,
+            &out,
+            params,
+            (total.div_ceil(256), 1, 1),
+        );
+        Ok(out)
+    }
+
+    /// [`Self::attn_out`] over an int8 V cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_out_q8(
+        &self,
+        probs: &GpuBuffer,
+        v_q: &GpuBuffer,
+        v_scale: &GpuBuffer,
+        seq_q: usize,
+        kv_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<GpuBuffer> {
+        if probs.len != heads * seq_q * kv_len
+            || v_q.len * 4 < kv_len * kv_heads * head_dim
+            || v_scale.len < kv_len * kv_heads
+        {
+            return Err(WgpuError::Shape("attn_out_q8: shape mismatch".into()));
+        }
+        let out = self.alloc_out(seq_q * heads * head_dim);
+        let params = Params {
+            m: seq_q as u32,
+            k: kv_len as u32,
+            n_heads: heads as u32,
+            n_kv_heads: kv_heads as u32,
+            head_dim: head_dim as u32,
+            ..Default::default()
+        };
+        let total = (seq_q * heads * head_dim) as u32;
+        self.dispatch4(
+            &self.inner.pipelines.attn_out_q8,
+            probs,
+            v_q,
+            v_scale,
+            &out,
+            params,
+            (total.div_ceil(256), 1, 1),
+        );
+        Ok(out)
+    }
+
     /// Copy `rows` rows of `row_elems` f32 each from `src` into `dst`
     /// starting at row `dst_row` — KV-cache append.
     pub fn copy_rows(
@@ -1612,45 +1764,83 @@ impl WgpuDevice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuantDtype {
     Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
     Q8_0,
+    Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
+    F16,
+    Bf16,
 }
 
 impl QuantDtype {
-    pub const ALL: [QuantDtype; 5] = [
+    pub const ALL: [QuantDtype; 12] = [
         QuantDtype::Q4_0,
+        QuantDtype::Q4_1,
+        QuantDtype::Q5_0,
+        QuantDtype::Q5_1,
         QuantDtype::Q8_0,
+        QuantDtype::Q2K,
+        QuantDtype::Q3K,
         QuantDtype::Q4K,
         QuantDtype::Q5K,
         QuantDtype::Q6K,
+        QuantDtype::F16,
+        QuantDtype::Bf16,
     ];
 
     pub fn block_elems(self) -> usize {
         match self {
-            QuantDtype::Q4_0 | QuantDtype::Q8_0 => 32,
-            QuantDtype::Q4K | QuantDtype::Q5K | QuantDtype::Q6K => 256,
+            QuantDtype::Q4_0
+            | QuantDtype::Q4_1
+            | QuantDtype::Q5_0
+            | QuantDtype::Q5_1
+            | QuantDtype::Q8_0
+            | QuantDtype::F16
+            | QuantDtype::Bf16 => 32,
+            QuantDtype::Q2K
+            | QuantDtype::Q3K
+            | QuantDtype::Q4K
+            | QuantDtype::Q5K
+            | QuantDtype::Q6K => 256,
         }
     }
 
     pub fn block_bytes(self) -> usize {
         match self {
             QuantDtype::Q4_0 => 18,
+            QuantDtype::Q4_1 => 20,
+            QuantDtype::Q5_0 => 22,
+            QuantDtype::Q5_1 => 24,
             QuantDtype::Q8_0 => 34,
+            QuantDtype::Q2K => 84,
+            QuantDtype::Q3K => 110,
             QuantDtype::Q4K => 144,
             QuantDtype::Q5K => 176,
             QuantDtype::Q6K => 210,
+            // Dense 16-bit rows in 32-element dot units.
+            QuantDtype::F16 | QuantDtype::Bf16 => 64,
         }
     }
 
     fn fn_suffix(self) -> &'static str {
         match self {
             QuantDtype::Q4_0 => "q4_0",
+            QuantDtype::Q4_1 => "q4_1",
+            QuantDtype::Q5_0 => "q5_0",
+            QuantDtype::Q5_1 => "q5_1",
             QuantDtype::Q8_0 => "q8_0",
+            QuantDtype::Q2K => "q2_k",
+            QuantDtype::Q3K => "q3_k",
             QuantDtype::Q4K => "q4_k",
             QuantDtype::Q5K => "q5_k",
             QuantDtype::Q6K => "q6_k",
+            QuantDtype::F16 => "f16",
+            QuantDtype::Bf16 => "bf16",
         }
     }
 }

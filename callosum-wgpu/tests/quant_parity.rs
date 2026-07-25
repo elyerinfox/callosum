@@ -21,10 +21,17 @@ fn ggml_of(fmt: QuantDtype) -> callosum::quantized::GgmlDType {
     use callosum::quantized::GgmlDType as G;
     match fmt {
         QuantDtype::Q4_0 => G::Q4_0,
+        QuantDtype::Q4_1 => G::Q4_1,
+        QuantDtype::Q5_0 => G::Q5_0,
+        QuantDtype::Q5_1 => G::Q5_1,
         QuantDtype::Q8_0 => G::Q8_0,
+        QuantDtype::Q2K => G::Q2K,
+        QuantDtype::Q3K => G::Q3K,
         QuantDtype::Q4K => G::Q4K,
         QuantDtype::Q5K => G::Q5K,
         QuantDtype::Q6K => G::Q6K,
+        QuantDtype::F16 => G::F16,
+        QuantDtype::Bf16 => G::BF16,
     }
 }
 
